@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
-接收 mic_probe 固件从串口发来的录音，按通道存成 WAV。
+从 USB 串口接收设备发来的录音，存成 WAV。支持两种固件：
+
+1. firmware/（正式固件，里程碑 2）——会话协议，和第 5 节上传协议一一对应：
+     @@BEGIN session=1 device_id=... sample_rate=16000 channels=1 format=pcm_s16le
+     @@CHUNK session=1 seq=0 bytes=32000 crc32=xxxxxxxx b64=...
+     @@MARK  session=1 offset_ms=12345
+     @@END   session=1 last_seq=29
+   收到 END 后检查分片是否齐全，按 seq 拼接成：
+     recordings/session_<时间>_<device>_s<N>.wav  以及同名 .json（打点、缺片、校验结果）
+
+2. hw-test/mic_probe（诊断固件）——四路原始 PCM，按通道各存一个 WAV。
 
 用法（用 ESP-IDF 自带的 python，里面有 pyserial）：
     . ~/esp/esp-idf/export.sh
-    python tools/serial_capture.py                 # 默认 /dev/cu.usbmodem101
-    python tools/serial_capture.py -p /dev/cu.usbmodemXXX -o recordings
-
-待机时会滚动显示四路电平；在板子上按 BOOT 录 5 秒，录完自动保存：
-    recordings/probe_<时间>_ch0.wav ... ch3.wav，以及 4 声道的 _all.wav
+    python tools/serial_capture.py                    # 默认 /dev/cu.usbmodem101
+    python tools/serial_capture.py -q                 # 不打印设备日志
 按 Ctrl+C 退出。
 """
 import argparse
 import base64
 import binascii
+import json
+import math
 import re
 import struct
 import sys
@@ -23,19 +32,93 @@ from pathlib import Path
 
 import serial
 
-BEGIN_RE = re.compile(r"===PCM BEGIN rate=(\d+) ch=(\d+) bits=16 bytes=(\d+) crc32=([0-9a-f]+)===")
+ROOT = Path(__file__).resolve().parent.parent
+KV_RE = re.compile(r"(\w+)=(\S+)")
+PROBE_BEGIN_RE = re.compile(r"===PCM BEGIN rate=(\d+) ch=(\d+) bits=16 bytes=(\d+) crc32=([0-9a-f]+)===")
 
 
-def save(outdir: Path, pcm: bytes, rate: int, ch: int) -> None:
+def kv(line: str) -> dict:
+    return dict(KV_RE.findall(line))
+
+
+def dbfs(samples) -> float:
+    if not samples:
+        return -90.0
+    rms = math.sqrt(sum(v * v for v in samples) / len(samples))
+    return -90.0 if rms < 1 else 20 * math.log10(rms / 32768)
+
+
+class Session:
+    def __init__(self, meta: dict):
+        self.id = int(meta["session"])
+        self.device_id = meta.get("device_id", "unknown")
+        self.rate = int(meta.get("sample_rate", 16000))
+        self.chunks: dict[int, bytes] = {}
+        self.marks: list[int] = []
+        self.bad_crc: list[int] = []
+        self.dup = 0
+        self.t0 = time.time()
+
+    def add_chunk(self, meta: dict, b64: str) -> None:
+        seq = int(meta["seq"])
+        try:
+            data = base64.b64decode(b64)
+        except binascii.Error:
+            self.bad_crc.append(seq)
+            return
+        ok = len(data) == int(meta["bytes"]) and (binascii.crc32(data) & 0xFFFFFFFF) == int(meta["crc32"], 16)
+        if not ok:
+            self.bad_crc.append(seq)
+            return
+        if seq in self.chunks:
+            self.dup += 1  # 幂等：重复 seq 直接忽略
+            return
+        self.chunks[seq] = data
+
+    def finish(self, last_seq: int, outdir: Path) -> None:
+        expected = list(range(last_seq + 1)) if last_seq >= 0 else []
+        missing = [s for s in expected if s not in self.chunks]
+        pcm = b"".join(self.chunks.get(s, b"\x00" * 32000) for s in expected)  # 缺片补静音，保证时间轴不错位
+        outdir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(self.t0))
+        base = outdir / f"session_{stamp}_{self.device_id[-6:]}_s{self.id}"
+        with wave.open(str(base.with_suffix(".wav")), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.rate)
+            w.writeframes(pcm)
+        n = len(pcm) // 2
+        samples = struct.unpack(f"<{n}h", pcm) if n else ()
+        info = {
+            "device_id": self.device_id,
+            "session": self.id,
+            "duration_s": round(n / self.rate, 3),
+            "chunks_received": len(self.chunks),
+            "last_seq": last_seq,
+            "missing_seq": missing,
+            "bad_crc_seq": self.bad_crc,
+            "duplicate_chunks": self.dup,
+            "marks_ms": self.marks,
+            "rms_dbfs": round(dbfs(samples), 1),
+            "peak": max((abs(v) for v in samples), default=0),
+        }
+        base.with_suffix(".json").write_text(json.dumps(info, ensure_ascii=False, indent=2))
+        ok = not missing and not self.bad_crc
+        print(f"\n{'✅' if ok else '⚠️ '} 会话 {self.id} 已保存：{base.with_suffix('.wav')}")
+        print(f"   时长 {info['duration_s']:.2f} 秒，分片 {len(self.chunks)}/{len(expected)}，"
+              f"缺片 {missing or '无'}，校验失败 {self.bad_crc or '无'}，"
+              f"打点 {[round(m / 1000, 1) for m in self.marks] or '无'}（秒），"
+              f"电平 {info['rms_dbfs']} dBFS，峰值 {info['peak']}\n")
+
+
+def save_probe(outdir: Path, pcm: bytes, rate: int, ch: int) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d_%H%M%S")
     n = len(pcm) // (2 * ch)
     samples = struct.unpack(f"<{n * ch}h", pcm[: n * ch * 2])
-
     with wave.open(str(outdir / f"probe_{stamp}_all.wav"), "wb") as w:
         w.setnchannels(ch); w.setsampwidth(2); w.setframerate(rate)
         w.writeframes(pcm[: n * ch * 2])
-
     print(f"\n已保存 {n / rate:.2f} 秒，{ch} 路：")
     for c in range(ch):
         mono = samples[c::ch]
@@ -43,49 +126,77 @@ def save(outdir: Path, pcm: bytes, rate: int, ch: int) -> None:
         with wave.open(str(path), "wb") as w:
             w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
             w.writeframes(struct.pack(f"<{len(mono)}h", *mono))
-        rms = (sum(v * v for v in mono) / max(len(mono), 1)) ** 0.5
-        peak = max((abs(v) for v in mono), default=0)
-        db = -90.0 if rms < 1 else 20 * __import__("math").log10(rms / 32768)
-        print(f"  ch{c}: RMS {db:6.1f} dBFS  peak {peak:5d}  → {path}")
+        print(f"  ch{c}: RMS {dbfs(mono):6.1f} dBFS  peak {max((abs(v) for v in mono), default=0):5d}  → {path}")
     print()
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--port", default="/dev/cu.usbmodem101")
-    ap.add_argument("-o", "--outdir", default=str(Path(__file__).resolve().parent.parent / "recordings"))
+    ap.add_argument("-o", "--outdir", default=str(ROOT / "recordings"))
+    ap.add_argument("-q", "--quiet", action="store_true", help="不打印设备日志")
     args = ap.parse_args()
+    outdir = Path(args.outdir)
 
     ser = serial.Serial(args.port, 115200, timeout=1)
-    print(f"监听 {args.port}，在板子上按 BOOT 开始录音（Ctrl+C 退出）")
-    collecting = None  # (rate, ch, nbytes, crc, [chunks])
+    print(f"监听 {args.port}，录音保存到 {outdir}（Ctrl+C 退出）")
+    sessions: dict[int, Session] = {}
+    probe = None  # mic_probe: (rate, ch, nbytes, crc, [lines])
+
     while True:
         raw = ser.readline()
         if not raw:
             continue
         line = raw.decode(errors="replace").rstrip("\r\n")
-        if collecting is None:
-            m = BEGIN_RE.search(line)
-            if m:
-                rate, ch, nbytes = int(m[1]), int(m[2]), int(m[3])
-                collecting = (rate, ch, nbytes, int(m[4], 16), [])
-                print(f"接收中：{nbytes} 字节 …", end="", flush=True)
-            elif line:
-                print(line)
+
+        if probe is not None:
+            if line.startswith("===PCM END==="):
+                rate, ch, nbytes, crc, parts = probe
+                probe = None
+                pcm = base64.b64decode("".join(parts))
+                ok = len(pcm) == nbytes and (binascii.crc32(pcm) & 0xFFFFFFFF) == crc
+                print(f"收到 {len(pcm)} 字节，校验{'通过' if ok else '失败'}")
+                save_probe(outdir, pcm, rate, ch)
+            else:
+                probe[4].append(line.strip())
             continue
-        if line.startswith("===PCM END==="):
-            rate, ch, nbytes, crc, chunks = collecting
-            collecting = None
-            try:
-                pcm = base64.b64decode("".join(chunks))
-            except binascii.Error as e:
-                print(f"\nbase64 解码失败：{e}")
-                continue
-            ok = len(pcm) == nbytes and (binascii.crc32(pcm) & 0xFFFFFFFF) == crc
-            print(f" 收到 {len(pcm)} 字节，校验{'通过' if ok else '失败（数据可能不完整）'}")
-            save(Path(args.outdir), pcm, rate, ch)
+
+        if line.startswith("@@CHUNK"):
+            head, _, b64 = line.partition(" b64=")
+            meta = kv(head)
+            s = sessions.get(int(meta["session"]))
+            if s:
+                s.add_chunk(meta, b64.strip())
+                print(f"\r   接收中：{len(s.chunks)} 秒" + (f"（校验失败 {len(s.bad_crc)}）" if s.bad_crc else ""),
+                      end="", flush=True)
             continue
-        collecting[4].append(line.strip())
+        if line.startswith("@@BEGIN"):
+            meta = kv(line)
+            sessions[int(meta["session"])] = Session(meta)
+            print(f"\n● 会话 {meta['session']} 开始（设备 {meta.get('device_id')}）")
+            continue
+        if line.startswith("@@MARK"):
+            meta = kv(line)
+            s = sessions.get(int(meta["session"]))
+            if s:
+                s.marks.append(int(meta["offset_ms"]))
+                print(f"\n   ★ 打点 {int(meta['offset_ms']) / 1000:.1f} 秒")
+            continue
+        if line.startswith("@@END"):
+            meta = kv(line)
+            s = sessions.pop(int(meta["session"]), None)
+            if s:
+                s.finish(int(meta["last_seq"]), outdir)
+            else:
+                print(f"\n⚠️  收到会话 {meta['session']} 的 END，但没收到它的 BEGIN（脚本开晚了？）")
+            continue
+        m = PROBE_BEGIN_RE.search(line)
+        if m:
+            probe = (int(m[1]), int(m[2]), int(m[3]), int(m[4], 16), [])
+            print(f"接收诊断录音 {m[3]} 字节 …")
+            continue
+        if line and not args.quiet and not line.startswith("LVL") and " xport: " not in line:
+            print(f"\n   [设备] {line}")
 
 
 if __name__ == "__main__":
