@@ -1,0 +1,19 @@
+# secrets
+firmware/main/secrets.h
+server/.env
+
+# ESP-IDF build output
+**/build/
+**/managed_components/
+**/sdkconfig.old
+
+# server data (recordings / transcripts)
+server/data/
+server/.venv/
+__pycache__/
+*.pyc
+
+.DS_Store
+
+# test recordings (voice data, keep local)
+recordings/
