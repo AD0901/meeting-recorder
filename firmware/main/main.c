@@ -1,6 +1,7 @@
 /*
  * 会议录音器固件 — 里程碑 2：按键录音 + 屏幕状态 + 串口导出
  *
+ *   屏幕：点 REC 开始；录音中点 MARK 打点、点 STOP 停止；结束后显示 Done，点 NEW 回到待机
  *   PLUS（右键）短按：开始 / 停止录音
  *   BOOT（左键）短按：录音中打点
  *   PWR （中键）长按：关机（保持官方行为，仅电池供电时生效）
@@ -29,8 +30,12 @@ static void on_plus(void *btn, void *arg)
 {
     capture_status_t st;
     capture_get_status(&st);
-    if (st.recording) capture_request_stop();
-    else              capture_request_start();
+    if (st.recording) {
+        capture_request_stop();
+    } else {
+        ui_dismiss_done();
+        capture_request_start();
+    }
 }
 
 static void on_boot(void *btn, void *arg)

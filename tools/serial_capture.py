@@ -23,6 +23,7 @@ import base64
 import binascii
 import json
 import math
+import os
 import re
 import struct
 import sys
@@ -75,7 +76,7 @@ class Session:
             return
         self.chunks[seq] = data
 
-    def finish(self, last_seq: int, outdir: Path) -> None:
+    def finish(self, last_seq: int, outdir: Path) -> Path:
         expected = list(range(last_seq + 1)) if last_seq >= 0 else []
         missing = [s for s in expected if s not in self.chunks]
         pcm = b"".join(self.chunks.get(s, b"\x00" * 32000) for s in expected)  # 缺片补静音，保证时间轴不错位
@@ -109,6 +110,7 @@ class Session:
               f"缺片 {missing or '无'}，校验失败 {self.bad_crc or '无'}，"
               f"打点 {[round(m / 1000, 1) for m in self.marks] or '无'}（秒），"
               f"电平 {info['rms_dbfs']} dBFS，峰值 {info['peak']}\n")
+        return base.with_suffix(".wav")
 
 
 def save_probe(outdir: Path, pcm: bytes, rate: int, ch: int) -> None:
@@ -130,21 +132,72 @@ def save_probe(outdir: Path, pcm: bytes, rate: int, ch: int) -> None:
     print()
 
 
+def make_minutes(wav: Path) -> None:
+    """调用 server/poc_tingwu.py（听悟）生成纪要，并在浏览器打开。"""
+    import subprocess
+    server = ROOT / "server"
+    print("→ 自动生成会议纪要（通义听悟）…")
+    proc = subprocess.run([str(server / ".venv/bin/python"), "-u", str(server / "poc_tingwu.py"), str(wav)],
+                          cwd=server, capture_output=True, text=True)
+    out = proc.stdout + proc.stderr
+    for line in out.replace("\r", "\n").splitlines():
+        if line.strip() and "已等待" not in line:
+            print("   " + line)
+    page = next((l.split("：", 1)[1].strip() for l in out.splitlines() if l.startswith("✅ 纪要页面：")), None)
+    if page:
+        subprocess.run(["open", page])
+
+
+def port_ino(port):
+    try:
+        return os.stat(port).st_ino
+    except OSError:
+        return None
+
+
+def open_port(port):
+    """打开串口；设备不在就一直等。返回 (串口, 设备节点 inode)。"""
+    while True:
+        ino = port_ino(port)
+        if ino is not None:
+            try:
+                return serial.Serial(port, 115200, timeout=1), ino
+            except (serial.SerialException, OSError):
+                pass
+        time.sleep(1)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-p", "--port", default="/dev/cu.usbmodem101")
     ap.add_argument("-o", "--outdir", default=str(ROOT / "recordings"))
     ap.add_argument("-q", "--quiet", action="store_true", help="不打印设备日志")
+    ap.add_argument("--minutes", action="store_true", help="收到录音后自动调用通义听悟生成纪要并打开页面")
     args = ap.parse_args()
     outdir = Path(args.outdir)
 
-    ser = serial.Serial(args.port, 115200, timeout=1)
+    ser, ino = open_port(args.port)
     print(f"监听 {args.port}，录音保存到 {outdir}（Ctrl+C 退出）")
+    last_check = time.time()
     sessions: dict[int, Session] = {}
     probe = None  # mic_probe: (rate, ch, nbytes, crc, [lines])
 
     while True:
-        raw = ser.readline()
+        try:
+            raw = ser.readline()
+        except (serial.SerialException, OSError):
+            raw, ino = b"", None  # 设备拔掉 / 重启：强制重连
+        # USB-JTAG 重新枚举后旧句柄不再收数据也不报错，定期比对设备节点
+        if ino is None or (time.time() - last_check > 2 and port_ino(args.port) != ino):
+            try:
+                ser.close()
+            except Exception:
+                pass
+            print("\n⚠️  串口断开，等待设备重新连接 …", flush=True)
+            ser, ino = open_port(args.port)
+            print(f"✅ 已重新连接 {args.port}", flush=True)
+        if time.time() - last_check > 2:
+            last_check = time.time()
         if not raw:
             continue
         line = raw.decode(errors="replace").rstrip("\r\n")
@@ -186,7 +239,9 @@ def main() -> int:
             meta = kv(line)
             s = sessions.pop(int(meta["session"]), None)
             if s:
-                s.finish(int(meta["last_seq"]), outdir)
+                wav = s.finish(int(meta["last_seq"]), outdir)
+                if args.minutes:
+                    make_minutes(wav)
             else:
                 print(f"\n⚠️  收到会话 {meta['session']} 的 END，但没收到它的 BEGIN（脚本开晚了？）")
             continue

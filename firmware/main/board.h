@@ -10,6 +10,7 @@
 #include "esp_codec_dev.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_touch.h"
 
 #define BOARD_SAMPLE_RATE   16000
 #define BOARD_IN_CH         4      /* ES7210 TDM slot 数 */
@@ -34,6 +35,7 @@ esp_codec_dev_handle_t board_speaker(void);  /* 单声道 16bit */
 
 void board_lcd_init(esp_lcd_panel_io_handle_t *io, esp_lcd_panel_handle_t *panel, size_t max_transfer_bytes);
 void board_backlight(uint8_t percent);
+esp_lcd_touch_handle_t board_touch_init(void);  /* CST816，失败返回 NULL */
 
 int  board_battery_mv(void);       /* 读不到返回 -1 */
 int  board_battery_percent(void);  /* 粗略电量 0–100 */

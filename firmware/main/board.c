@@ -11,6 +11,7 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_touch_cst816s.h"
 #include "esp_log.h"
 
 static const char *TAG = "board";
@@ -33,7 +34,10 @@ static const char *TAG = "board";
 #define PIN_LCD_DC      45
 #define PIN_LCD_RST     40
 #define PIN_LCD_BL      46
+#define PIN_TP_INT      48
+#define PIN_TP_RST      47
 
+static i2c_master_bus_handle_t s_i2c;
 static esp_codec_dev_handle_t s_mic;
 static esp_codec_dev_handle_t s_spk;
 static adc_oneshot_unit_handle_t s_adc;
@@ -158,7 +162,6 @@ void board_init(void)
 {
     power_init();
 
-    i2c_master_bus_handle_t bus;
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = PIN_I2C_SDA,
@@ -167,9 +170,9 @@ void board_init(void)
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus));
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &s_i2c));
 
-    audio_init(bus);
+    audio_init(s_i2c);
     ESP_LOGI(TAG, "board ready (mic gain %.1f dB, MIC1=slot%d MIC2=slot%d)",
              BOARD_IN_GAIN_DB, BOARD_MIC1_SLOT, BOARD_MIC2_SLOT);
 }
@@ -262,4 +265,24 @@ int board_battery_percent(void)
 bool board_is_charging(void)
 {
     return gpio_get_level(PIN_CHARGING) == 0;
+}
+
+esp_lcd_touch_handle_t board_touch_init(void)
+{
+    esp_lcd_panel_io_handle_t io = NULL;
+    esp_lcd_panel_io_i2c_config_t io_cfg = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
+    io_cfg.scl_speed_hz = 400 * 1000;
+    if (esp_lcd_new_panel_io_i2c(s_i2c, &io_cfg, &io) != ESP_OK) return NULL;
+    esp_lcd_touch_config_t cfg = {
+        .x_max = BOARD_LCD_W,
+        .y_max = BOARD_LCD_H,
+        .rst_gpio_num = PIN_TP_RST,
+        .int_gpio_num = PIN_TP_INT,
+    };
+    esp_lcd_touch_handle_t tp = NULL;
+    if (esp_lcd_touch_new_i2c_cst816s(io, &cfg, &tp) != ESP_OK) {
+        ESP_LOGW(TAG, "touch init failed, buttons only");
+        return NULL;
+    }
+    return tp;
 }
