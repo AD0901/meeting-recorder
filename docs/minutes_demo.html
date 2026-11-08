@@ -1,0 +1,42 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>【示例】会议录音器原型评审会</title><style>
+:root{--bg:#f6f7f9;--paper:#fff;--ink:#1f2328;--dim:#6b7280;--line:#e5e7eb;--accent:#2563eb;--hl:#fff7e6}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--paper:#171a21;--ink:#e6e8eb;--dim:#9aa3ad;--line:#2a2f3a;--accent:#60a5fa;--hl:#2b2516}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 16px;display:grid;grid-template-columns:180px 1fr;gap:28px}
+nav{position:sticky;top:24px;align-self:start;display:flex;flex-direction:column;gap:2px}
+nav a{color:var(--dim);text-decoration:none;padding:6px 10px;border-radius:6px;font-size:14px}nav a:hover{background:var(--paper);color:var(--ink)}
+header,section{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:22px 26px;margin-bottom:16px}
+h1{font-size:24px;margin:0 0 6px}h2{font-size:17px;margin:0 0 14px;padding-left:10px;border-left:3px solid var(--accent)}h4{margin:16px 0 6px;font-size:15px}
+.meta-row{color:var(--dim);font-size:13px;display:flex;flex-wrap:wrap;gap:18px}
+.bars{margin-top:14px;display:grid;gap:6px}.bar{display:grid;grid-template-columns:12px 72px 1fr 40px;align-items:center;gap:8px;font-size:13px}
+.dot{width:10px;height:10px;border-radius:50%}.track{height:6px;background:var(--line);border-radius:3px;overflow:hidden}.track span{display:block;height:100%}.pct{color:var(--dim);text-align:right}
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}.tag{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);padding:2px 10px;border-radius:999px;font-size:13px}
+p{margin:6px 0}ul,ol{margin:6px 0;padding-left:22px}
+table.todo{width:100%;border-collapse:collapse;font-size:14px}.todo th,.todo td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top}.todo th{color:var(--dim);font-weight:500}.chk{width:24px;color:var(--dim)}
+.timeline{list-style:none;padding:0}.timeline li{display:grid;grid-template-columns:60px 1fr;gap:12px;padding:8px 0;border-bottom:1px dashed var(--line)}
+.ts{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums;margin-left:8px}.timeline .ts{margin:3px 0 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}.card{border:1px solid var(--line);border-top:3px solid var(--c);border-radius:10px;padding:12px 14px}
+.who{font-weight:600;display:flex;align-items:center;gap:6px}.who i{width:8px;height:8px;border-radius:50%;background:var(--c)}
+details{border-bottom:1px solid var(--line);padding:8px 0}summary{cursor:pointer;font-weight:600}
+.seg{padding:8px 10px;border-radius:8px}.seg.hl{background:var(--hl)}.seg .meta{font-size:13px;font-weight:600}.mark{margin-left:8px;color:#d97706;font-size:12px}
+footer{color:var(--dim);font-size:12px;text-align:center;padding:8px}
+@media (max-width:760px){.wrap{grid-template-columns:1fr}nav{display:none}header,section{padding:18px 16px}}
+@media print{nav{display:none}.wrap{display:block}body{background:#fff}}
+</style></head><body><div class="wrap"><nav><a href="#summary">会议摘要</a><a href="#actions">待办事项</a><a href="#next">下一步规划</a><a href="#chapters">章节速览</a><a href="#speakers">发言总结</a><a href="#qa">问答回顾</a><a href="#transcript">会议全文</a></nav><main>
+<header><h1>【示例】会议录音器原型评审会</h1>
+<div class="meta-row"><span>📅 2026-11-08 18:03</span><span>⏱ 25 分 20 秒</span>
+<span>👥 3 位发言人</span><span>★ 1 处重点</span></div>
+<div class="bars"><div class="bar"><span class="dot" style="background:#2563eb"></span><span class="nm">高一丹</span><span class="track"><span style="width:47%;background:#2563eb"></span></span><span class="pct">47%</span></div><div class="bar"><span class="dot" style="background:#d97706"></span><span class="nm">张三</span><span class="track"><span style="width:31%;background:#d97706"></span></span><span class="pct">31%</span></div><div class="bar"><span class="dot" style="background:#059669"></span><span class="nm">李四</span><span class="track"><span style="width:22%;background:#059669"></span></span><span class="pct">22%</span></div></div></header>
+<section id="summary"><h2>会议摘要</h2><div class="tags"><span class="tag">会议录音器</span><span class="tag">说话人分离</span><span class="tag">私有化部署</span><span class="tag">通义听悟</span><span class="tag">麦克风阵列</span><span class="tag">知识图谱</span></div><p>本次会议评审了会议录音器原型的进展。设备端已完成按键录音、屏幕状态和本地缓冲，下一步接入 Wi-Fi 上传与转写服务。与会者认为私有化部署是主要差异点，但板载双麦拾音距离有限，正式方案需更换麦克风阵列。</p>
+<ul>
+<li>原型已跑通录音与导出，音频完整无丢片</li>
+<li>转写与纪要先用通义听悟验证效果，后续支持本地模型切换</li>
+<li>纪要需支持上传 PPT 作为补充材料</li>
+</ul><h4>要点</h4><ul><li>客户最关心数据是否出公司</li><li>6 人以上会议需要更好的拾音硬件</li></ul></section><section id="actions"><h2>待办事项</h2><table class="todo"><thead><tr><th></th><th>事项</th><th>负责人</th><th>截止</th></tr></thead><tbody><tr><td class="chk">☐</td><td>完成设备 Wi-Fi 配网与分片上传</td><td>高一丹</td><td>下周三</td></tr><tr><td class="chk">☐</td><td>调研带 DSP 的麦克风阵列模块并给出报价</td><td>张三</td><td>本周五</td></tr><tr><td class="chk">☐</td><td>整理 3 家竞品的纪要样例做对比</td><td>李四</td><td>未明确</td></tr></tbody></table></section><section id="next"><h2>下一步规划</h2><ul>
+<li>用真实 3 人会议录音验证说话人分离准确率（负责人：高一丹；时间：下周）</li>
+<li>确认私有化部署的服务器配置（负责人：张三；时间：未明确）</li>
+</ul></section><section id="chapters"><h2>章节速览</h2><ol class="timeline"><li><span class="ts">00:00</span><div><b>原型进展汇报</b><p>介绍录音、屏幕、缓冲三项已完成的功能和测试结果。</p></div></li><li><span class="ts">06:00</span><div><b>拾音硬件讨论</b><p>板载麦克风只适合近距离，讨论换阵列麦克风的成本。</p></div></li><li><span class="ts">15:00</span><div><b>交付形式与竞品</b><p>对比通义听悟、飞书妙记，确定纪要页面结构。</p></div></li></ol></section><section id="speakers"><h2>发言总结</h2><div class="cards"><div class="card" style="--c:#2563eb"><div class="who"><i></i>高一丹</div><p>汇报原型进展，提出先用听悟验证纪要效果，再做本地化与模型切换。</p></div><div class="card" style="--c:#d97706"><div class="who"><i></i>张三</div><p>关注拾音距离与硬件成本，建议评估 XVF3800 等阵列方案。</p></div><div class="card" style="--c:#059669"><div class="who"><i></i>李四</div><p>从客户视角强调私有化与知识库沉淀，建议纪要支持附件材料。</p></div></div></section><section id="qa"><h2>问答回顾</h2><details open><summary>设备断网时录音会丢吗？</summary><p>设备内存可缓冲约 2 分钟；TF 卡到货后改为先存卡、有网再补传。</p></details></section><section id="transcript"><h2>会议全文</h2><div class="seg"><div class="meta" style="color:#2563eb">高一丹<span class="ts">00:05</span></div><p>今天主要同步一下录音器原型的进展，按键录音和屏幕都已经可以用了。</p></div><div class="seg hl"><div class="meta" style="color:#d97706">张三<span class="ts">07:20</span><span class="mark" title="设备上标记的重点">★ 重点</span></div><p>我比较担心拾音距离，会议室大一点的话板载麦克风可能不够。</p></div><div class="seg"><div class="meta" style="color:#059669">李四<span class="ts">15:02</span></div><p>客户那边最在意的是数据能不能留在自己公司。</p></div></section>
+<footer>由 示例数据（未调用任何接口） 生成 · 内容仅依据会议录音整理，请核对后再分发</footer>
+</main></div></body></html>
