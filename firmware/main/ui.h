@@ -10,3 +10,5 @@
 void ui_init(esp_lcd_panel_io_handle_t io, esp_lcd_panel_handle_t panel);
 void ui_show_power_off(void);
 void ui_dismiss_done(void);   /* DONE 页回到 READY（侧键 [+] 也能用） */
+void ui_request_setup(void);  /* 显示提示后重启进入配网模式 */
+void ui_net_ready(void);     /* 网络模块启动后调用（配网模式要画二维码） */

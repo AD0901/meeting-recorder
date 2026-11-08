@@ -1,0 +1,15 @@
+[Unit]
+Description=Meeting Recorder server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=meetrec
+WorkingDirectory=/opt/meeting-recorder/server
+ExecStart=/opt/meeting-recorder/server/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 120 --no-access-log
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
