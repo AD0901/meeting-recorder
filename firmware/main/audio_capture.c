@@ -15,7 +15,7 @@ static const char *TAG = "capture";
 #define FRAME_SAMPLES  320                                /* 20ms */
 #define FRAME_BYTES    (FRAME_SAMPLES * BOARD_IN_CH * 2)
 
-enum { REQ_START = 1 << 0, REQ_STOP = 1 << 1, REQ_MARK = 1 << 2 };
+enum { REQ_START = 1 << 0, REQ_STOP = 1 << 1, REQ_MARK = 1 << 2, REQ_PAUSE = 1 << 3 };
 static volatile uint32_t s_req;
 
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -24,6 +24,7 @@ static capture_status_t s_st;
 void capture_request_start(void) { __atomic_or_fetch(&s_req, REQ_START, __ATOMIC_SEQ_CST); }
 void capture_request_stop(void)  { __atomic_or_fetch(&s_req, REQ_STOP,  __ATOMIC_SEQ_CST); }
 void capture_request_mark(void)  { __atomic_or_fetch(&s_req, REQ_MARK,  __ATOMIC_SEQ_CST); }
+void capture_request_pause(void) { __atomic_or_fetch(&s_req, REQ_PAUSE, __ATOMIC_SEQ_CST); }
 
 void capture_get_status(capture_status_t *out)
 {
@@ -72,6 +73,7 @@ static void capture_task(void *arg)
     esp_codec_dev_handle_t mic = board_mic();
 
     bool recording = false;
+    bool paused = false;
     uint32_t session = 0;
     uint32_t seq = 0;            /* 下一个音频分片序号 */
     uint64_t samples = 0;        /* 本次已录采样数（含被丢弃的） */
@@ -106,6 +108,7 @@ static void capture_task(void *arg)
 
         if ((req & REQ_START) && !recording) {
             recording = true;
+            paused = false;
             session++;
             seq = 0;
             samples = 0;
@@ -117,7 +120,19 @@ static void capture_task(void *arg)
             ESP_LOGI(TAG, "session %lu START", (unsigned long)session);
         }
 
-        if (recording && (req & REQ_MARK)) {
+        if (recording && (req & REQ_PAUSE)) {
+            paused = !paused;
+            /* 暂停时把不满 1 秒的尾巴先写出去：数据及时落卡，恢复后从新片开始，拼接无缝 */
+            if (paused && cur_fill > 0) {
+                push_audio(stage, cur_fill, session, seq);
+                seq++;
+                cur_fill = 0;
+            }
+            ESP_LOGI(TAG, "session %lu %s at %.1f s", (unsigned long)session,
+                     paused ? "PAUSE" : "RESUME", samples / (double)BOARD_SAMPLE_RATE);
+        }
+
+        if (recording && !paused && (req & REQ_MARK)) {
             uint32_t offset_ms = (uint32_t)(samples * 1000 / BOARD_SAMPLE_RATE);
             push_ctrl(CHUNK_MARK, session, offset_ms);
             portENTER_CRITICAL(&s_lock);
@@ -125,7 +140,7 @@ static void capture_task(void *arg)
             portEXIT_CRITICAL(&s_lock);
         }
 
-        if (recording) {
+        if (recording && !paused) {   /* 暂停时继续读麦克风（防 DMA 溢出），但不写卡 */
             for (int i = 0; i < FRAME_SAMPLES; i++) {
                 stage[cur_fill++] = mono[i];
                 samples++;
@@ -146,6 +161,7 @@ static void capture_task(void *arg)
             uint32_t last_seq = seq ? seq - 1 : UINT32_MAX;
             push_ctrl(CHUNK_END, session, last_seq);
             recording = false;
+            paused = false;
             cur_fill = 0;
             ESP_LOGI(TAG, "session %lu STOP: %.1f s, %lu chunks, last_seq %ld",
                      (unsigned long)session, samples / (double)BOARD_SAMPLE_RATE,
@@ -154,6 +170,7 @@ static void capture_task(void *arg)
 
         portENTER_CRITICAL(&s_lock);
         s_st.recording = recording;
+        s_st.paused = recording && paused;
         s_st.level_db = level;
         if (recording) s_st.elapsed_ms = (uint32_t)(samples * 1000 / BOARD_SAMPLE_RATE);
         s_st.chunks = seq;

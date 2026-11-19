@@ -44,6 +44,7 @@ static lv_obj_t *s_ready_status, *s_ready_pending, *s_rec_net, *s_send_title, *s
 static lv_obj_t *s_setup_ssid, *s_setup_qr;
 /* REC */
 static lv_obj_t *s_rec_dot, *s_rec_time, *s_rec_marks, *s_rec_level;
+static lv_obj_t *s_btn_mark, *s_btn_pause, *s_pause_label;
 /* CONFIRM */
 static lv_obj_t *s_confirm_info;
 /* SENDING */
@@ -114,6 +115,7 @@ static void on_rec_tap(lv_event_t *e)
     if (sd.card_ok) capture_request_start();   /* 无卡：READY 状态行已有提示 */
 }
 static void on_stop_tap(lv_event_t *e) { capture_request_stop(); }
+static void on_pause_tap(lv_event_t *e) { capture_request_pause(); }
 static void on_mark_tap(lv_event_t *e) { capture_request_mark(); s_mark_flash = 3; }
 static void on_wifi_tap(lv_event_t *e) { ui_request_setup(); }
 static void on_save_tap(lv_event_t *e)    { s_btn_req |= REQ_SAVE; }
@@ -215,27 +217,43 @@ static void refresh_cb(lv_timer_t *t)
 
     if (cap.recording) {
         show_view(V_REC);
-        if (!sd.card_ok) {
-            lv_label_set_text(s_rec_net, LV_SYMBOL_WARNING " No TF card!");
+        if (cap.paused) {
+            /* 暂停态：计时冻结、MARK 隐藏、RESUME 绿色、圆点琥珀常亮、音量条归零 */
+            lv_label_set_text(s_rec_net, LV_SYMBOL_PAUSE " PAUSED");
             lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
-        } else if (sd.write_error) {
-            lv_label_set_text(s_rec_net, LV_SYMBOL_WARNING " Card write error!");
-            lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
-        } else if (ring_used() > 30) {   /* 写卡明显滞后 */
-            lv_label_set_text_fmt(s_rec_net, LV_SYMBOL_WARNING " Card busy %lu s", (unsigned long)ring_used());
-            lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
+            lv_label_set_text(s_pause_label, "RESUME");
+            lv_obj_set_style_bg_color(s_btn_pause, COLOR_GREEN, 0);
+            lv_obj_add_flag(s_btn_mark, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_rec_dot, COLOR_AMBER, 0);
+            lv_obj_clear_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
+            lv_bar_set_value(s_rec_level, -60, LV_ANIM_OFF);
         } else {
-            lv_label_set_text(s_rec_net, LV_SYMBOL_SD_CARD " Saving to TF card");
-            lv_obj_set_style_text_color(s_rec_net, COLOR_DIM, 0);
+            lv_label_set_text(s_pause_label, "PAUSE");
+            lv_obj_set_style_bg_color(s_btn_pause, COLOR_PANEL, 0);
+            lv_obj_clear_flag(s_btn_mark, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_color(s_rec_dot, COLOR_RED, 0);
+            if (!sd.card_ok) {
+                lv_label_set_text(s_rec_net, LV_SYMBOL_WARNING " No TF card!");
+                lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
+            } else if (sd.write_error) {
+                lv_label_set_text(s_rec_net, LV_SYMBOL_WARNING " Card write error!");
+                lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
+            } else if (ring_used() > 30) {   /* 写卡明显滞后 */
+                lv_label_set_text_fmt(s_rec_net, LV_SYMBOL_WARNING " Card busy %lu s", (unsigned long)ring_used());
+                lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
+            } else {
+                lv_label_set_text(s_rec_net, LV_SYMBOL_SD_CARD " Saving to TF card");
+                lv_obj_set_style_text_color(s_rec_net, COLOR_DIM, 0);
+            }
+            if (tick % 10 < 6) lv_obj_clear_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
+            else               lv_obj_add_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
+            int lvl = (int)cap.level_db;
+            lv_bar_set_value(s_rec_level, lvl < -60 ? -60 : lvl, LV_ANIM_OFF);
         }
         lv_label_set_text_fmt(s_rec_time, "%02lu:%02lu", (unsigned long)(sec / 60), (unsigned long)(sec % 60));
         lv_label_set_text_fmt(s_rec_marks, LV_SYMBOL_BELL "  %lu", (unsigned long)cap.marks);
         lv_obj_set_style_text_color(s_rec_marks, s_mark_flash ? COLOR_AMBER : COLOR_TEXT, 0);
         if (s_mark_flash) s_mark_flash--;
-        if (tick % 10 < 6) lv_obj_clear_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
-        else               lv_obj_add_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
-        int lvl = (int)cap.level_db;
-        lv_bar_set_value(s_rec_level, lvl < -60 ? -60 : lvl, LV_ANIM_OFF);
         return;
     }
 
@@ -328,10 +346,13 @@ static void build_screen(void)
     lv_obj_align(s_rec_marks, LV_ALIGN_TOP_MID, 0, 88);
     s_rec_net = mk_label(v, &lv_font_montserrat_14, COLOR_DIM, "");
     lv_obj_align(s_rec_net, LV_ALIGN_TOP_MID, 0, 114);
-    lv_obj_t *mark = mk_button(v, 100, 64, COLOR_AMBER, 14, LV_SYMBOL_BELL " MARK", &lv_font_montserrat_14, on_mark_tap);
-    lv_obj_align(mark, LV_ALIGN_BOTTOM_LEFT, 12, -10);
-    lv_obj_t *stop = mk_button(v, 100, 64, COLOR_RED, 14, LV_SYMBOL_STOP " STOP", &lv_font_montserrat_14, on_stop_tap);
-    lv_obj_align(stop, LV_ALIGN_BOTTOM_RIGHT, -12, -10);
+    s_btn_mark = mk_button(v, 72, 64, COLOR_AMBER, 14, LV_SYMBOL_BELL, &lv_font_montserrat_20, on_mark_tap);
+    lv_obj_align(s_btn_mark, LV_ALIGN_BOTTOM_LEFT, 6, -10);
+    s_btn_pause = mk_button(v, 72, 64, COLOR_PANEL, 14, "PAUSE", &lv_font_montserrat_14, on_pause_tap);
+    lv_obj_align(s_btn_pause, LV_ALIGN_BOTTOM_MID, 0, -10);
+    s_pause_label = lv_obj_get_child(s_btn_pause, 0);
+    lv_obj_t *stop = mk_button(v, 72, 64, COLOR_RED, 14, LV_SYMBOL_STOP, &lv_font_montserrat_20, on_stop_tap);
+    lv_obj_align(stop, LV_ALIGN_BOTTOM_RIGHT, -6, -10);
 
     /* CONFIRM：录完确认，Save 才上传 */
     v = s_view[V_CONFIRM] = mk_view(scr);
