@@ -50,6 +50,15 @@ class Tingwu:
         self.bucket.put_object_from_file(key, str(path))
         return key, self.bucket.sign_url("GET", key, 6 * 3600, slash_safe=True)
 
+    def upload_temporary(self, path: Path) -> tuple[str, str]:
+        """本地上传专用：音频只放在临时前缀，转写结束后立即删除。"""
+        key = f"{self.prefix}tmp/web-upload/{uuid.uuid4().hex}{path.suffix.lower()}"
+        self.bucket.put_object_from_file(key, str(path))
+        return key, self.bucket.sign_url("GET", key, 6 * 3600, slash_safe=True)
+
+    def delete(self, key: str) -> None:
+        self.bucket.delete_object(key)
+
     # ---------- 听悟 ----------
     def _request(self, method: str, uri: str, body: dict | None = None, query: dict | None = None) -> dict:
         req = CommonRequest()
@@ -107,9 +116,10 @@ class Tingwu:
             time.sleep(10)
 
     @staticmethod
-    def download_results(task_info: dict, outdir: Path) -> dict:
-        """把 Result 里每个签名链接对应的 JSON 下载到 outdir，返回 {名称: 内容}。"""
-        outdir.mkdir(parents=True, exist_ok=True)
+    def download_results(task_info: dict, outdir: Path | None = None) -> dict:
+        """下载 Result JSON；设备会话可落盘，本地上传只在内存中处理。"""
+        if outdir is not None:
+            outdir.mkdir(parents=True, exist_ok=True)
         results = {}
         for name, url in (task_info.get("Result") or {}).items():
             if not url:
@@ -117,7 +127,8 @@ class Tingwu:
             r = requests.get(url, timeout=60)
             r.raise_for_status()
             results[name] = r.json()
-            (outdir / f"{name}.json").write_text(json.dumps(results[name], ensure_ascii=False, indent=2))
+            if outdir is not None:
+                (outdir / f"{name}.json").write_text(json.dumps(results[name], ensure_ascii=False, indent=2))
         return results
 
 

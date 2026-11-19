@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Adhere 会议纪要：录音、转写、AI 纪要问答与在线编辑，让每场讨论沉淀为准确、可执行的结果。">
+  <meta name="description" content="Adhere 会议纪要：设备录音或上传本地音频与文档，自动转写、AI 纪要问答与在线编辑，源文件不保留。">
   <title>Adhere · 让讨论沉淀为行动</title>
   <style>
     :root {
@@ -88,6 +88,8 @@
     .format-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 15px; }
     .format-chips span { padding: 3px 8px; border: 1px solid #cbd8bf; border-radius: 7px; background: rgba(255,255,255,.55); color: var(--green); font-size: 10px; font-weight: 650; }
     .enhance-feature > a { flex-shrink: 0; white-space: nowrap; }
+    .local-upload-feature { margin-top: 0; margin-bottom: 18px; background: #eef2e9; }
+    .local-upload-feature .privacy-chips span { background: #fff; }
     .interaction-feature { position: relative; display: grid; grid-template-columns: .94fr 1.06fr; gap: 48px; margin-top: 10px; padding: 42px; overflow: hidden; border-radius: 26px; background: var(--ink); color: #fff; scroll-margin-top: 20px; }
     .interaction-feature::before { content: ""; position: absolute; width: 360px; height: 360px; right: -130px; top: -160px; border-radius: 50%; background: rgba(201,242,119,.08); }
     .interaction-copy { position: relative; }
@@ -264,6 +266,15 @@
           <article class="card"><span class="number">02</span><h3>理解对话</h3><p>自动转写并区分不同发言人，重点内容随时打点，回顾更准确。</p></article>
           <article class="card"><span class="number">03</span><h3>沉淀行动</h3><p>提炼观点、结论和待办，让每场会议都有清晰、可追踪的结果。</p></article>
         </div>
+        <div class="enhance-feature local-upload-feature">
+          <div>
+            <div class="eyebrow">LOCAL AUDIO UPLOAD</div>
+            <h3>本地音频和文档，也能生成一场新纪要。</h3>
+            <p>不用设备录音也没关系。上传一段本地会议音频，可同时添加相关文档，自动完成转写、纪要和资料增强。</p>
+            <div class="format-chips privacy-chips"><span>源音频与文档不保留</span><span>云端只留存会议纪要</span></div>
+          </div>
+          <a class="text-link" href="https://app.adhere.icu/upload">上传本地音频 ↗</a>
+        </div>
         <div class="enhance-feature">
           <div>
             <div class="eyebrow">DOCUMENT ENHANCED</div>
@@ -340,7 +351,7 @@
       <section class="faq" id="faq">
         <div class="section-title"><h2>开始使用前，你可能想知道</h2></div>
         <div class="faq-list">
-          <article class="faq-item"><h3>录音后需要手动整理吗？</h3><p>停止录音并上传后，云端会自动完成转写与纪要生成。之后可以继续向 AI 提问，也可以手动校正并保存。</p></article>
+          <article class="faq-item"><h3>录音后需要手动整理吗？</h3><p>设备录音或本地上传的音频都会自动转写并生成纪要，还可同时上传文档补充背景。之后可以继续向 AI 提问，也可以手动校正并保存。</p></article>
           <article class="faq-item"><h3>能区分不同发言人吗？</h3><p>可以。纪要会按发言人整理原文与发言占比，方便回顾每个人的观点和讨论过程。</p></article>
           <article class="faq-item"><h3>手机上可以查看吗？</h3><p>可以。首页与会议页面都支持手机浏览器，摘要、待办和全文会针对小屏幕调整排版。</p></article>
         </div>

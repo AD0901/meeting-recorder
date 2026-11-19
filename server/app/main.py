@@ -45,6 +45,8 @@ from app.storage import make_storage  # noqa: E402
 
 DATA_DIR = Path(os.getenv("DATA_DIR", SERVER_DIR / "data")) / "sessions"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_SUPPORTED = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
+MAX_AUDIO_BYTES = 200 * 1024 * 1024
 API_TOKEN = os.getenv("API_TOKEN", "").strip()
 ASR_PROVIDER = os.getenv("ASR_PROVIDER", "tingwu").strip().lower()   # tingwu / none
 AUTO_OPEN = os.getenv("AUTO_OPEN", "1") == "1"                      # 纪要好了在本机浏览器打开（服务端跑在 Mac 上时）
@@ -362,6 +364,124 @@ def notify(sid: str, title: str) -> None:
     subprocess.run(["open", f"{PUBLIC_URL}/sessions/{sid}"], check=False)
 
 
+# ---------------------------------------------------------------- 本地音频 / 文档上传（源文件不长期保留）
+
+def clear_web_upload_key(sid: str) -> None:
+    with _lock:
+        meta = load_meta(sid)
+        meta.pop("upload_oss_key", None)
+        save_meta(meta)
+
+
+def web_upload_task(sid: str, tmp_dir: str, doc_names: dict[str, str]) -> None:
+    """本地文件只临时使用：最终目录仅保留纪要、必要的元数据和可选增强纪要。"""
+    tmp = Path(tmp_dir)
+    tw = None
+    oss_key = ""
+    try:
+        from app.providers.tingwu import Tingwu, to_minutes
+
+        docs = []
+        for p in sorted(tmp.glob("doc-*")):
+            original_name = doc_names.get(p.name, p.name)
+            try:
+                docs.append((original_name, extract_text(p)))
+            except ExtractError as e:
+                raise RuntimeError(f"{original_name}：{e}") from e
+            finally:
+                p.unlink(missing_ok=True)   # 文档解析出文字后立即删除原文件
+
+        audio = next(tmp.glob("source.*"))
+        tw = Tingwu()
+        oss_key, url = tw.upload_temporary(audio)
+        audio.unlink(missing_ok=True)       # 进入临时 OSS 后，不再保留服务器上的源音频
+        update_meta(sid, upload_oss_key=oss_key)
+        task_id = tw.create_task(url)
+        update_meta(sid, status="transcribing")
+        log(f"   {sid} 本地音频转写任务 {task_id}，等待结果 …")
+        info = tw.wait(task_id)
+        results = Tingwu.download_results(info)   # 原始结果只在内存中，不写 tingwu/ 目录
+        minutes = to_minutes(results, marks_ms=[])
+        meta = load_meta(sid)
+        minutes.setdefault("date", meta.get("created_at"))
+        mj, page = save_minutes(sid, minutes)
+        storage.put(f"sessions/{sid}/minutes.html", page)
+        storage.put(f"sessions/{sid}/minutes.json", mj)
+        update_meta(sid, status="done", title=minutes.get("title"),
+                    duration_s=minutes.get("duration_s"), error=None)
+        log(f"✅ {sid} 本地音频纪要完成")
+
+        if docs:
+            update_meta(sid, enhance_status="processing", enhance_error=None)
+            try:
+                content, usage = enhance_minutes(minutes, docs)
+                enhanced = sdir(sid) / "enhanced.md"
+                enhanced.write_text(content)
+                storage.put(f"sessions/{sid}/enhanced.md", enhanced)
+                update_meta(sid, enhance_status="done", enhance_usage=usage, enhance_error=None)
+                log(f"✨ {sid} 文档增强纪要完成")
+            except Exception as e:  # 基础纪要已生成，文档增强失败时保留基础结果
+                traceback.print_exc()
+                update_meta(sid, enhance_status="failed", enhance_error=f"{type(e).__name__}: {e}"[:300])
+        notify(sid, minutes.get("title") or "会议纪要已生成")
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        try:
+            update_meta(sid, status="failed", error=f"{type(e).__name__}: {e}"[:300])
+        except Exception:
+            pass
+        log(f"❌ {sid} 本地上传处理失败：{e}")
+    finally:
+        if tw is not None and oss_key:
+            try:
+                tw.delete(oss_key)
+            except Exception as e:  # 删除失败保留 key，下次服务启动时继续清理
+                log(f"⚠️ {sid} 临时音频删除失败，将在重启后重试：{e}")
+            else:
+                try:
+                    clear_web_upload_key(sid)
+                except Exception:
+                    pass
+        shutil.rmtree(tmp, ignore_errors=True)
+        log(f"🧹 {sid} 本地上传临时文件清理完成")
+
+
+def cleanup_interrupted_web_uploads() -> None:
+    """进程异常退出后，启动时继续清理临时 OSS 音频和服务器临时目录。"""
+    from app.providers.tingwu import Tingwu
+
+    tw = None
+    for path in DATA_DIR.glob("*/meta.json"):
+        try:
+            meta = json.loads(path.read_text())
+            sid = meta["session_id"]
+            key = meta.get("upload_oss_key")
+            if meta.get("source") != "web_upload" or not key:
+                continue
+            if tw is None:
+                tw = Tingwu()
+            try:
+                tw.delete(key)
+            except Exception as e:
+                log(f"⚠️ {sid} 启动清理临时音频失败，下次继续重试：{e}")
+            else:
+                with _lock:
+                    fresh = load_meta(sid)
+                    fresh.pop("upload_oss_key", None)
+                    fresh.update(status="failed", error="服务重启导致处理中断，请重新上传")
+                    save_meta(fresh)
+        except Exception as e:
+            log(f"⚠️ 启动清理会话临时文件时出现异常：{e}")
+    tmp_root = DATA_DIR.parent / "tmp"
+    for path in tmp_root.glob("web-upload-*"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+@app.on_event("startup")
+def start_interrupted_upload_cleanup() -> None:
+    threading.Thread(target=cleanup_interrupted_web_uploads, daemon=True).start()
+
+
 # ---------------------------------------------------------------- 网页
 
 STATUS_ZH = {"uploading": "上传中", "processing": "拼接音频", "transcribing": "转写与总结中",
@@ -381,6 +501,7 @@ body{min-width:320px}
 h1{margin:0;font-size:32px;line-height:1.25;letter-spacing:-1px;overflow-wrap:anywhere}
 .page-heading p{margin:10px 0 0;color:var(--dim);font-size:14px}
 .count{flex-shrink:0;padding:7px 13px;border:1px solid var(--line);border-radius:99px;color:var(--dim);font-size:12px}
+.heading-actions{display:flex;align-items:center;gap:12px;flex-shrink:0}.source-tag{display:inline-flex;margin-left:7px;padding:2px 7px;border-radius:6px;background:color-mix(in srgb,var(--accent) 9%,transparent);color:var(--accent);font-size:10px;font-style:normal;font-weight:500;vertical-align:middle}.upload-field-label{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:22px 0 9px;color:var(--ink);font-size:13px;font-weight:650}.upload-field-label span{color:var(--dim);font-size:11px;font-weight:400}.upload-zone.compact{min-height:160px}
 .table-wrap{overflow:hidden;background:var(--paper);border:1px solid var(--line);border-radius:20px;box-shadow:0 12px 30px rgba(23,34,28,.04)}
 table{width:100%;border-collapse:collapse}
 td,th{padding:17px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
@@ -423,7 +544,7 @@ td{color:var(--dim);font-size:13px}td:last-child{width:130px;text-align:right}
 .primary-button{border:1px solid var(--button-bg);background:var(--button-bg);color:var(--button-text)}.secondary-button{border:1px solid var(--line);background:var(--paper);color:var(--ink)}
 .refresh-note{margin:24px 0 0;color:var(--dim);font-size:12px}
 @media (max-width:720px){
-.topbar{padding:18px}.topbar-note{display:none}.shell{padding:22px 14px 45px}.page-heading{align-items:flex-start;margin-bottom:22px}h1{font-size:27px}.page-heading p{font-size:13px}.count{margin-top:4px}
+.topbar{padding:18px}.topbar-note{display:none}.shell{padding:22px 14px 45px}.page-heading{align-items:flex-start;margin-bottom:22px}h1{font-size:27px}.page-heading p{font-size:13px}.count{margin-top:4px}.heading-actions{align-items:flex-end;flex-direction:column-reverse}.heading-actions .primary-button{padding:9px 12px;font-size:11px}
 .table-wrap{overflow:visible;background:transparent;border:0;box-shadow:none}table,tbody,tr,td{display:block;width:100%}thead{display:none}
 tr{margin-bottom:13px;padding:17px 18px;background:var(--paper);border:1px solid var(--line);border-radius:17px}
 td{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:6px 0;border:0;text-align:right}td::before{content:attr(data-label);color:var(--dim);font-size:12px;white-space:nowrap}
@@ -474,7 +595,8 @@ def index():
             }.get(enhance_st, ("资料增强", "enhance", ""))
             enhance_link = (f"<a class='secondary-link {cls}' href='/sessions/{sid}/{path}' "
                             f"title='上传会议资料，AI 结合文档生成增强纪要'>{label}</a>")
-        rows.append(f"<tr><td data-label='会议'><a class='meeting-link' href='/sessions/{sid}'><strong>{title}</strong><span>{sid}</span></a></td>"
+        source_badge = "<em class='source-tag'>本地上传</em>" if m.get("source") == "web_upload" else ""
+        rows.append(f"<tr><td data-label='会议'><a class='meeting-link' href='/sessions/{sid}'><strong>{title}</strong>{source_badge}<span>{sid}</span></a></td>"
                     f"<td data-label='时间'>{m.get('created_at', '')}</td><td data-label='时长'>{fmt_dur(m.get('duration_s'))}</td>"
                     f"<td data-label='打点'>{len(m.get('marks_ms', []))} 处</td>"
                     f"<td data-label='状态'><span class='st {st}'>{STATUS_ZH.get(st, st)}</span></td>"
@@ -482,7 +604,8 @@ def index():
     empty = ("<tr><td class='empty-cell' colspan='6'><div class='empty'><div class='empty-mark' aria-hidden='true'><i></i><i></i><i></i></div>"
              "<h2>还没有会议记录</h2><p>在设备上点 REC 开始，停止后选 SAVE 上传，会议会自动出现在这里。</p></div></td></tr>")
     body = (f"<div class='page-heading'><div><div class='eyebrow'>MEETING LIBRARY</div><h1>会议记录</h1>"
-            f"<p>每一场讨论，都整理成可以回顾与行动的结果。</p></div><span class='count'>{len(sessions)} 场会议</span></div>"
+            f"<p>每一场讨论，都整理成可以回顾与行动的结果。</p></div><div class='heading-actions'>"
+            f"<a class='primary-button' href='/upload'>上传音频生成纪要</a><span class='count'>{len(sessions)} 场会议</span></div></div>"
             "<div class='table-wrap'><table><thead><tr><th>会议</th><th>时间</th><th>时长</th><th>打点</th><th>状态</th><th></th></tr></thead><tbody>"
             + ("".join(rows) or empty) + "</tbody></table></div>")
     busy = any(m.get("status") not in ("done", "failed") or m.get("enhance_status") == "processing" for m in sessions)
@@ -505,9 +628,12 @@ def session_page(sid: str):
         return HTMLResponse(mp.read_text())
 
     st = meta.get("status", "")
-    current = {"uploading": 0, "processing": 1, "transcribing": 2}.get(st, -1)
+    is_web_upload = meta.get("source") == "web_upload"
+    current = ({"processing": 0, "transcribing": 1} if is_web_upload else
+               {"uploading": 0, "processing": 1, "transcribing": 2}).get(st, -1)
+    step_labels = ("文件上传与解析", "语音转写", "纪要生成") if is_web_upload else ("录音上传", "音频拼接", "转写与总结")
     steps = []
-    for i, label in enumerate(("录音上传", "音频拼接", "转写与总结")):
+    for i, label in enumerate(step_labels):
         complete = st == "done" or current > i
         cls = "complete" if complete else ("current" if current == i else "")
         steps.append(f"<li class='step {cls}'><span class='step-number'>{'✓' if complete else i + 1}</span>{label}</li>")
@@ -517,15 +643,17 @@ def session_page(sid: str):
         extra = (f"<div class='progress-note'><strong>{len(received_seqs(sid))} 秒</strong>"
                  "<span>云端已接收的录音时长，设备会继续上传。</span></div>")
     elif st == "failed":
-        extra = (f"<div class='error-box'>{html.escape(meta.get('error') or '处理过程中出现未知错误')}</div>"
-                 f"<form method='post' action='/sessions/{sid}/retry'><button class='primary-button' type='submit'>重新处理</button></form>")
+        retry_action = (f"<a class='primary-button' href='/upload'>重新上传文件</a>" if is_web_upload else
+                        f"<form method='post' action='/sessions/{sid}/retry'><button class='primary-button' type='submit'>重新处理</button></form>")
+        extra = (f"<div class='error-box'>{html.escape(meta.get('error') or '处理过程中出现未知错误')}</div>" + retry_action)
     elif sdir(sid).joinpath("audio.wav").exists():
         extra = f"<a class='secondary-button' href='/sessions/{sid}/audio.wav'>下载录音</a>"
 
     title = html.escape(meta.get("title") or "会议处理进度")
     note = "可检查错误信息后重新处理。" if st == "failed" else "本页每 5 秒自动刷新，纪要生成后会直接显示。"
+    status_label = ("文件准备中" if st == "processing" else STATUS_ZH.get(st, st)) if is_web_upload else STATUS_ZH.get(st, st)
     body = (f"<section class='status-card'><div class='eyebrow'>MEETING STATUS</div><h1>{title}</h1>"
-            f"<p class='session-id'>{sid}</p><div class='status-line'><span class='st {st}'>{STATUS_ZH.get(st, st)}</span></div>"
+            f"<p class='session-id'>{sid}</p><div class='status-line'><span class='st {st}'>{status_label}</span></div>"
             f"<ol class='steps'>{''.join(steps)}</ol>{extra}<p class='refresh-note'>{note}</p></section>")
     return page(meta.get("title") or sid, body, refresh=None if st == "failed" else 5)
 
@@ -603,6 +731,202 @@ def delete_session(sid: str):
     shutil.rmtree(sdir(sid), ignore_errors=True)
     log(f"🗑 会话 {sid} 已删除")
     return RedirectResponse("/", status_code=303)
+
+
+# ---------------------------------------------------------------- 本地音频 / 文档上传页面
+
+async def save_upload_limited(upload: UploadFile, path: Path, max_bytes: int, label: str) -> None:
+    total = 0
+    with path.open("wb") as out:
+        while chunk := await upload.read(1024 * 1024):
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(400, f"{label}超过大小上限")
+            out.write(chunk)
+    if not total:
+        raise HTTPException(400, f"{label}是空文件")
+
+
+LOCAL_UPLOAD_SCRIPT = r"""
+<script>
+(() => {
+  const configs = [
+    {inputId: 'audio', zoneId: 'audio-zone', selectionId: 'audio-selection', extensions: new Set(__AUDIO_EXTENSIONS__), maxBytes: __MAX_AUDIO_BYTES__, multiple: false, kind: '音频'},
+    {inputId: 'documents', zoneId: 'docs-zone', selectionId: 'docs-selection', extensions: new Set(__DOC_EXTENSIONS__), maxBytes: __MAX_DOC_BYTES__, multiple: true, kind: '文档'},
+  ];
+  const form = document.getElementById('local-upload-form');
+  const audioInput = document.getElementById('audio');
+  const submitButton = document.getElementById('local-upload-submit');
+  const errorBox = document.getElementById('upload-error');
+  const formatSize = bytes => bytes >= 1048576
+    ? `${(bytes / 1048576).toFixed(1)} MB`
+    : `${Math.max(1, Math.ceil(bytes / 1024))} KB`;
+
+  function updateSubmit() {
+    submitButton.disabled = !audioInput.files.length || configs.some(config => config.invalid);
+  }
+
+  function render(config) {
+    const input = document.getElementById(config.inputId);
+    const selection = document.getElementById(config.selectionId);
+    const files = Array.from(input.files || []);
+    config.invalid = false;
+    selection.replaceChildren();
+    errorBox.classList.remove('show');
+    errorBox.textContent = '';
+    if (!files.length) { updateSubmit(); return; }
+
+    const summary = document.createElement('p');
+    summary.className = 'file-summary';
+    summary.textContent = `已选择 ${files.length} 个${config.kind}，共 ${formatSize(files.reduce((sum, file) => sum + file.size, 0))}`;
+    selection.appendChild(summary);
+    const list = document.createElement('ul');
+    list.className = 'file-list';
+    for (const file of files) {
+      const dot = file.name.lastIndexOf('.');
+      const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
+      const wrongType = !config.extensions.has(ext);
+      const tooLarge = file.size > config.maxBytes;
+      const tooMany = !config.multiple && files.length !== 1;
+      const reason = tooMany ? '只能选择 1 个音频' : (wrongType ? '格式不支持' : (tooLarge ? '超过大小上限' : ''));
+      if (reason) config.invalid = true;
+      const item = document.createElement('li');
+      item.className = `file-item${reason ? ' invalid' : ''}`;
+      const name = document.createElement('span');
+      name.className = 'file-name';
+      name.textContent = file.name;
+      const size = document.createElement('span');
+      size.className = 'file-size';
+      size.textContent = `${formatSize(file.size)}${reason ? ` · ${reason}` : ''}`;
+      item.append(name, size);
+      list.appendChild(item);
+    }
+    selection.appendChild(list);
+    updateSubmit();
+  }
+
+  for (const config of configs) {
+    const input = document.getElementById(config.inputId);
+    const zone = document.getElementById(config.zoneId);
+    input.addEventListener('change', () => render(config));
+    for (const eventName of ['dragenter', 'dragover']) {
+      zone.addEventListener(eventName, event => {
+        event.preventDefault();
+        zone.classList.add('dragging');
+      });
+    }
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragging'));
+    zone.addEventListener('drop', event => {
+      event.preventDefault();
+      zone.classList.remove('dragging');
+      input.files = event.dataTransfer.files;
+      render(config);
+    });
+  }
+
+  form.addEventListener('submit', event => {
+    updateSubmit();
+    if (submitButton.disabled) {
+      event.preventDefault();
+      errorBox.textContent = '请选择 1 个音频，并移除格式不支持或超过大小上限的文件。';
+      errorBox.classList.add('show');
+      return;
+    }
+    submitButton.disabled = true;
+    submitButton.textContent = '正在上传源文件，请稍候…';
+  });
+  configs.forEach(render);
+})();
+</script>
+"""
+
+
+@app.get("/upload", response_class=HTMLResponse, dependencies=[Depends(check_web)])
+def local_upload_form():
+    if ASR_PROVIDER != "tingwu":
+        body = ("<section class='status-card enhance-card'><div class='eyebrow'>LOCAL AUDIO TO MINUTES</div>"
+                "<h1>上传本地音频</h1><div class='error-box'>服务端未启用通义听悟，暂时无法从音频生成纪要。</div>"
+                "<a class='secondary-button' href='/'>返回会议记录</a></section>")
+        return page("上传本地音频", body)
+    llm_note = "" if llm_ready() else "<p class='form-note'>当前未配置 LLM，仅支持音频生成；选择文档前需先配置大模型。</p>"
+    script = (LOCAL_UPLOAD_SCRIPT
+              .replace("__AUDIO_EXTENSIONS__", json.dumps(sorted(AUDIO_SUPPORTED)))
+              .replace("__DOC_EXTENSIONS__", json.dumps(sorted(SUPPORTED)))
+              .replace("__MAX_AUDIO_BYTES__", str(MAX_AUDIO_BYTES))
+              .replace("__MAX_DOC_BYTES__", str(MAX_FILE_BYTES)))
+    body = (f"<section class='status-card enhance-card'><div class='eyebrow'>LOCAL AUDIO TO MINUTES</div>"
+            "<h1>上传音频，生成新会议纪要</h1>"
+            "<p class='enhance-intro'>选择一段本地会议音频，也可以同时上传相关方案、报表或演示资料。系统会完成转写和纪要整理，文档会进一步补充背景与数据。</p>"
+            "<div class='privacy-note'><strong>源文件不保留</strong><span>音频仅临时用于听悟转写，文档仅提取文字供大模型生成。处理结束后立即删除源音频、源文档和临时文件，云端只保留会议纪要与转写结果。</span></div>"
+            "<form id='local-upload-form' method='post' action='/upload' enctype='multipart/form-data'>"
+            "<label class='upload-field-label' for='audio'>会议音频 <span>必选 · 单个不超过 200MB</span></label>"
+            f"<div class='upload-zone' id='audio-zone'><input id='audio' type='file' name='audio' required accept='{','.join(sorted(AUDIO_SUPPORTED))}' aria-label='选择会议音频'>"
+            "<div class='upload-prompt' aria-hidden='true'><div class='upload-icon'></div><span class='upload-title'>点击选择或拖拽 1 个音频</span>"
+            "<span class='upload-subtitle'>支持 WAV / MP3 / M4A / AAC / FLAC / OGG</span></div></div>"
+            "<div class='file-selection' id='audio-selection' aria-live='polite'></div>"
+            f"<label class='upload-field-label' for='documents'>相关资料 <span>可选 · 每个不超过 20MB</span></label>{llm_note}"
+            f"<div class='upload-zone compact' id='docs-zone'><input id='documents' type='file' name='documents' multiple accept='{','.join(sorted(SUPPORTED))}' aria-label='选择相关文档'>"
+            "<div class='upload-prompt' aria-hidden='true'><div class='upload-icon'></div><span class='upload-title'>点击选择或拖拽多份文档</span>"
+            "<span class='upload-subtitle'>Word / PPT / Excel / PDF / HTML / MD / TXT</span></div></div>"
+            "<div class='file-selection' id='docs-selection' aria-live='polite'></div>"
+            "<div class='upload-error' id='upload-error' role='alert'></div>"
+            "<div class='form-actions'><button class='primary-button' id='local-upload-submit' type='submit' disabled>上传并生成会议纪要</button>"
+            "<a class='secondary-button' href='/'>返回会议记录</a></div></form>"
+            "<p class='form-note'>上传完成后会跳转到进度页，可关闭页面，稍后从会议记录重新打开。</p></section>" + script)
+    return page("上传音频生成纪要", body)
+
+
+@app.post("/upload", dependencies=[Depends(check_web)])
+async def local_upload(bg: BackgroundTasks, audio: UploadFile = File(...),
+                       documents: list[UploadFile] | None = File(default=None)):
+    if ASR_PROVIDER != "tingwu":
+        raise HTTPException(400, "服务端未启用通义听悟")
+    audio_name = Path(audio.filename or "").name
+    audio_ext = Path(audio_name).suffix.lower()
+    if audio_ext not in AUDIO_SUPPORTED:
+        raise HTTPException(400, "音频格式不支持，请选择 WAV / MP3 / M4A / AAC / FLAC / OGG")
+    documents = [doc for doc in (documents or []) if doc.filename]
+    if documents and not llm_ready():
+        raise HTTPException(400, "未配置 LLM_API_KEY，暂时不能结合文档生成增强纪要")
+    for doc in documents:
+        if Path(Path(doc.filename).name).suffix.lower() not in SUPPORTED:
+            raise HTTPException(400, f"{Path(doc.filename).name}：文档格式不支持")
+
+    tmp = DATA_DIR.parent / "tmp" / f"web-upload-{uuid.uuid4().hex[:12]}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    doc_names = {}
+    try:
+        await save_upload_limited(audio, tmp / f"source{audio_ext}", MAX_AUDIO_BYTES, "音频")
+        for index, doc in enumerate(documents, 1):
+            original_name = Path(doc.filename).name
+            path = tmp / f"doc-{index:04d}{Path(original_name).suffix.lower()}"
+            doc_names[path.name] = original_name
+            await save_upload_limited(doc, path, MAX_FILE_BYTES, original_name)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    finally:
+        await audio.close()
+        for doc in documents:
+            await doc.close()
+
+    sid = f"web-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    sdir(sid).mkdir(parents=True)
+    meta = {
+        "session_id": sid,
+        "source": "web_upload",
+        "title": "本地音频会议纪要",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "processing",
+        "duration_s": 0,
+        "marks_ms": [],
+        "last_seq": None,
+        "enhance_status": "processing" if documents else "",
+    }
+    save_meta(meta)
+    bg.add_task(web_upload_task, sid, str(tmp), doc_names)
+    log(f"📤 {sid} 收到本地音频和 {len(documents)} 份文档，开始生成纪要")
+    return RedirectResponse(f"/sessions/{sid}", status_code=303)
 
 
 # ---------------------------------------------------------------- 资料增强纪要（可选功能）
