@@ -277,8 +277,10 @@ static void refresh_cb(lv_timer_t *t)
             uint32_t total = sd.saved_total ? sd.saved_total : 1;
             lv_bar_set_range(s_send_bar, 0, (int32_t)total);
             lv_bar_set_value(s_send_bar, (int32_t)xp.sent_chunks, LV_ANIM_OFF);
-            lv_label_set_text_fmt(s_send_label, "%lu / %lu s", (unsigned long)xp.sent_chunks,
-                                  (unsigned long)total);
+            /* 分片可能是 10 秒一片：按总时长估算已传秒数，比片数更直观 */
+            uint32_t sent_sec = (uint32_t)((uint64_t)xp.sent_chunks * sd.saved_duration_s / total);
+            lv_label_set_text_fmt(s_send_label, "%lu / %lu s", (unsigned long)sent_sec,
+                                  (unsigned long)sd.saved_duration_s);
             return;
         }
     }

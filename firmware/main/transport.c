@@ -51,7 +51,7 @@ static void pcm_path_of(char *out, size_t n, uint32_t id)
 /* ================================================================ 串口模式 */
 
 static unsigned char *s_b64;
-#define B64_CAP (CHUNK_MAX_BYTES * 4 / 3 + 8)
+#define B64_CAP (SD_UPLOAD_CHUNK_BYTES * 4 / 3 + 8)
 
 /* ================================================================ HTTP 工具 */
 
@@ -212,8 +212,8 @@ static result_t upload_http(rec_meta_t *m)
     }
 
     while (m->next_seq < m->total_chunks) {
-        fseek(f, (long)m->next_seq * CHUNK_MAX_BYTES, SEEK_SET);
-        size_t len = fread(s_pcm_buf, 1, CHUNK_MAX_BYTES, f);
+        fseek(f, (long)m->next_seq * m->chunk_bytes, SEEK_SET);
+        size_t len = fread(s_pcm_buf, 1, m->chunk_bytes, f);
         if (len == 0) break;
         char crc[12];
         snprintf(crc, sizeof(crc), "%08lx", (unsigned long)esp_rom_crc32_le(0, s_pcm_buf, len));
@@ -275,8 +275,8 @@ static result_t upload_serial(rec_meta_t *m)
     if (!f) return XR_DROP;
 
     while (m->next_seq < m->total_chunks) {
-        fseek(f, (long)m->next_seq * CHUNK_MAX_BYTES, SEEK_SET);
-        size_t len = fread(s_pcm_buf, 1, CHUNK_MAX_BYTES, f);
+        fseek(f, (long)m->next_seq * m->chunk_bytes, SEEK_SET);
+        size_t len = fread(s_pcm_buf, 1, m->chunk_bytes, f);
         if (len == 0) break;
         size_t olen = 0;
         mbedtls_base64_encode(s_b64, B64_CAP, &olen, s_pcm_buf, len);
@@ -368,7 +368,7 @@ void transport_start_task(void)
     snprintf(s_device_id, sizeof(s_device_id), "%02x%02x%02x%02x%02x%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     s_st.mode = netcfg_usable(net_config()) ? XPORT_HTTP : XPORT_SERIAL;
-    s_pcm_buf = heap_caps_malloc(CHUNK_MAX_BYTES, MALLOC_CAP_SPIRAM);
+    s_pcm_buf = heap_caps_malloc(SD_UPLOAD_CHUNK_BYTES, MALLOC_CAP_SPIRAM);
     assert(s_pcm_buf);
     if (s_st.mode == XPORT_SERIAL) {
         s_b64 = heap_caps_malloc(B64_CAP, MALLOC_CAP_SPIRAM);

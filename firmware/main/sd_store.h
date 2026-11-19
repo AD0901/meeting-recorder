@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #define SD_MAX_MARKS 64
+#define SD_UPLOAD_CHUNK_BYTES 320000   /* 上传分片：10 秒（减少公网往返次数，比 1 秒片快约 10 倍） */
 
 typedef enum {
     REC_RECORDING = 0,   /* 正在写卡（断电后重启也按待确认处理） */
@@ -28,7 +29,8 @@ typedef struct {
     uint32_t    id;
     rec_status_t status;
     uint32_t    duration_ms;
-    uint32_t    total_chunks;              /* 按文件字节数算出，含不满 1 秒的尾片 */
+    uint32_t    total_chunks;              /* 按 chunk_bytes 算出的上传片数 */
+    uint32_t    chunk_bytes;               /* 上传分片字节数（新录音 320000=10 秒；旧 meta 缺省 32000） */
     uint32_t    marks[SD_MAX_MARKS];       /* offset_ms */
     uint32_t    mark_count;
     char        session_id[48];            /* 云端会话 id，空 = 还没创建 */

@@ -71,6 +71,7 @@ static bool meta_write(const rec_meta_t *m)
     cJSON_AddStringToObject(j, "status", status_str(m->status));
     cJSON_AddNumberToObject(j, "duration_ms", m->duration_ms);
     cJSON_AddNumberToObject(j, "total_chunks", m->total_chunks);
+    cJSON_AddNumberToObject(j, "chunk_bytes", m->chunk_bytes);
     cJSON_AddStringToObject(j, "session_id", m->session_id);
     cJSON_AddNumberToObject(j, "next_seq", m->next_seq);
     cJSON *marks = cJSON_AddArrayToObject(j, "marks");
@@ -122,6 +123,8 @@ static bool meta_read(uint32_t id, rec_meta_t *m)
     }
     if ((v = cJSON_GetObjectItem(j, "duration_ms"))) m->duration_ms = v->valuedouble;
     if ((v = cJSON_GetObjectItem(j, "total_chunks"))) m->total_chunks = v->valuedouble;
+    m->chunk_bytes = 32000;   /* 旧 meta 没有该字段时按 1 秒片续传 */
+    if ((v = cJSON_GetObjectItem(j, "chunk_bytes")) && v->valuedouble > 0) m->chunk_bytes = v->valuedouble;
     if ((v = cJSON_GetObjectItem(j, "next_seq"))) m->next_seq = v->valuedouble;
     if ((v = cJSON_GetObjectItem(j, "session_id")) && cJSON_IsString(v)) {
         strlcpy(m->session_id, v->valuestring, sizeof(m->session_id));
@@ -300,6 +303,7 @@ static void writer_task(void *arg)
             memset(&s_cur, 0, sizeof(s_cur));
             s_cur.id = s_next_id;
             s_cur.status = REC_RECORDING;
+            s_cur.chunk_bytes = SD_UPLOAD_CHUNK_BYTES;
             s_cur_bytes = 0;
             s_recording = true;
             s_write_error = false;
@@ -352,7 +356,7 @@ static void writer_task(void *arg)
                 }
                 s_recording = false;
                 s_cur.duration_ms = s_cur_bytes / 32;   /* 32 B/ms @16kHz16bit mono */
-                s_cur.total_chunks = (s_cur_bytes + CHUNK_MAX_BYTES - 1) / CHUNK_MAX_BYTES;
+                s_cur.total_chunks = (s_cur_bytes + s_cur.chunk_bytes - 1) / s_cur.chunk_bytes;
                 s_cur.status = REC_CONFIRM;
                 if (s_cur.total_chunks == 0) {
                     delete_rec(s_cur.id);   /* 空录音直接丢 */
@@ -427,7 +431,7 @@ static void recover(void)
             set_confirm(&m);
             break;
         case REC_RECORDING:   /* 录音中断电：按实际字节数封成待确认，用户决定抢救还是丢弃 */
-            m.total_chunks = (st.st_size + CHUNK_MAX_BYTES - 1) / CHUNK_MAX_BYTES;
+            m.total_chunks = (st.st_size + m.chunk_bytes - 1) / m.chunk_bytes;
             m.duration_ms = st.st_size / 32;
             if (m.total_chunks == 0) {
                 delete_rec(id);
