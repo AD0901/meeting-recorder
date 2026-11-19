@@ -24,18 +24,21 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 import wave
 import zlib
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 SERVER_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(SERVER_DIR / ".env")
 
+from app.docs_extract import MAX_FILE_BYTES, SUPPORTED, ExtractError, extract_text  # noqa: E402
+from app.llm import enhance_minutes, llm_ready  # noqa: E402
 from app.minutes.render import BASE_CSS, render_html  # noqa: E402
 from app.storage import make_storage  # noqa: E402
 
@@ -320,7 +323,11 @@ h1{margin:0;font-size:32px;line-height:1.25;letter-spacing:-1px;overflow-wrap:an
 table{width:100%;border-collapse:collapse}
 td,th{padding:17px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
 tr:last-child td{border-bottom:0}th{background:color-mix(in srgb,var(--paper) 92%,var(--bg));color:var(--dim);font-size:12px;font-weight:550;white-space:nowrap}
-td{color:var(--dim);font-size:13px}td:last-child{width:64px;text-align:right}
+td{color:var(--dim);font-size:13px}td:last-child{width:130px;text-align:right}
+.op-cell{display:inline-flex;gap:12px;align-items:center}.secondary-link{color:var(--accent);font-size:12px;white-space:nowrap}
+.doc-body{max-width:860px}.doc-body h1{font-size:26px}.doc-body h2{font-size:19px;margin:26px 0 10px}.doc-body h3{font-size:16px;margin:20px 0 8px}
+.doc-body table{margin:12px 0}.doc-body td,.doc-body th{padding:8px 10px;border:1px solid var(--line);width:auto}
+.doc-body pre{background:var(--bg);padding:14px;border-radius:10px;overflow:auto}.doc-body blockquote{border-left:3px solid var(--line);margin:12px 0;padding:4px 14px;color:var(--dim)}
 .meeting-link{display:block;color:var(--ink);overflow-wrap:anywhere}.meeting-link strong{font-size:14px;font-weight:650}.meeting-link span{display:block;margin-top:3px;color:var(--dim);font-size:11px}
 .meeting-link:hover strong{color:var(--accent)}
 .st{display:inline-flex;align-items:center;padding:4px 10px;border-radius:99px;background:var(--line);color:var(--dim);font-size:12px;white-space:nowrap}
@@ -383,11 +390,13 @@ def index():
                    f"<button class='danger-link' type='submit'>删除</button></form>"
                    if deletable else "<span>—</span>")
         title = html.escape(m.get("title") or sid)
+        enhance_link = (f"<a class='secondary-link' href='/sessions/{sid}/enhance' "
+                        f"title='上传会议资料，AI 结合文档生成增强纪要'>资料增强</a>") if st == "done" else ""
         rows.append(f"<tr><td data-label='会议'><a class='meeting-link' href='/sessions/{sid}'><strong>{title}</strong><span>{sid}</span></a></td>"
                     f"<td data-label='时间'>{m.get('created_at', '')}</td><td data-label='时长'>{fmt_dur(m.get('duration_s'))}</td>"
                     f"<td data-label='打点'>{len(m.get('marks_ms', []))} 处</td>"
                     f"<td data-label='状态'><span class='st {st}'>{STATUS_ZH.get(st, st)}</span></td>"
-                    f"<td data-label='操作'>{del_btn}</td></tr>")
+                    f"<td data-label='操作'><span class='op-cell'>{enhance_link}{del_btn}</span></td></tr>")
     empty = ("<tr><td class='empty-cell' colspan='6'><div class='empty'><div class='empty-mark' aria-hidden='true'><i></i><i></i><i></i></div>"
              "<h2>还没有会议记录</h2><p>在设备上点 REC 开始，停止后选 SAVE 上传，会议会自动出现在这里。</p></div></td></tr>")
     body = (f"<div class='page-heading'><div><div class='eyebrow'>MEETING LIBRARY</div><h1>会议记录</h1>"
@@ -465,3 +474,127 @@ def delete_session(sid: str):
     shutil.rmtree(sdir(sid), ignore_errors=True)
     log(f"🗑 会话 {sid} 已删除")
     return RedirectResponse("/", status_code=303)
+
+
+# ---------------------------------------------------------------- 资料增强纪要（可选功能）
+
+def enhance_task(sid: str, tmp_dir: str) -> None:
+    """后台：解析上传的资料 → 调 LLM 生成增强纪要 → 删除上传原文件（不长期存云上）。"""
+    tmp = Path(tmp_dir)
+    try:
+        docs = []
+        for p in sorted(tmp.iterdir()):
+            try:
+                docs.append((p.name, extract_text(p)))
+            except ExtractError as e:
+                update_meta(sid, enhance_status="failed", enhance_error=f"{p.name}：{e}")
+                return
+        minutes = json.loads((sdir(sid) / "minutes.json").read_text())
+        content, usage = enhance_minutes(minutes, docs)
+        (sdir(sid) / "enhanced.md").write_text(content)
+        update_meta(sid, enhance_status="done", enhance_usage=usage, enhance_error=None)
+        log(f"✨ {sid} 增强纪要完成，tokens {usage.get('total_tokens')}")
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        try:
+            update_meta(sid, enhance_status="failed", enhance_error=f"{type(e).__name__}: {e}"[:300])
+        except Exception:
+            pass
+        log(f"❌ {sid} 增强纪要失败：{e}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)   # 上传的文档原文件即解析即删，不长期存云上
+
+
+@app.get("/sessions/{sid}/enhance", response_class=HTMLResponse, dependencies=[Depends(check_web)])
+def enhance_form(sid: str):
+    meta = load_meta(sid)
+    if not (sdir(sid) / "minutes.json").exists():
+        raise HTTPException(400, "基础纪要还没生成，等会议处理完成后再来")
+    title = html.escape(meta.get("title") or sid)
+    if not llm_ready():
+        body = ("<section class='status-card'><h1>资料增强</h1>"
+                "<p>服务端还没配置 LLM_API_KEY，暂时无法使用。请在 server/.env 中配置后重启服务。</p></section>")
+        return page("资料增强", body)
+    old = ""
+    if (sdir(sid) / "enhanced.md").exists():
+        old = (f"<p>已生成过一份：<a href='/sessions/{sid}/enhanced'>查看增强纪要</a>。重新上传会覆盖它。</p>")
+    body = (f"<section class='status-card'><div class='eyebrow'>DOCUMENT ENHANCED MINUTES</div>"
+            f"<h1>资料增强</h1><p class='session-id'>{title}</p>"
+            "<p>上传这场会议的相关资料（<strong>Word / PPT / Excel / PDF / HTML / MD / TXT</strong>，可多选，单文件 ≤ 20MB），"
+            "AI 会结合基础纪要、全文转写和文档内容，生成一份增强版会议纪要。</p>"
+            "<p style='color:var(--dim)'>🔒 文档只用于本次生成：解析出文字后<strong>立即删除原文件</strong>，"
+            "不在云端保留，也不会进入 OSS。云端只保留最终生成的增强纪要。</p>"
+            f"<form method='post' action='/sessions/{sid}/enhance' enctype='multipart/form-data'>"
+            "<p><input type='file' name='files' multiple required "
+            "accept='.docx,.pptx,.xlsx,.pdf,.html,.htm,.md,.txt'></p>"
+            "<button class='primary-button' type='submit'>上传并生成增强纪要</button> "
+            f"<a class='secondary-button' href='/sessions/{sid}'>返回会议</a></form>"
+            "<p style='color:var(--dim)'>生成约需 1 分钟，上传后页面会自动刷新结果。</p>"
+            f"{old}</section>")
+    return page("资料增强", body)
+
+
+@app.post("/sessions/{sid}/enhance", dependencies=[Depends(check_web)])
+async def enhance_upload(sid: str, bg: BackgroundTasks, files: list[UploadFile] = File(...)):
+    if not llm_ready():
+        raise HTTPException(400, "未配置 LLM_API_KEY")
+    if not (sdir(sid) / "minutes.json").exists():
+        raise HTTPException(400, "基础纪要还没生成")
+    files = [f for f in files if f.filename]
+    if not files:
+        raise HTTPException(400, "请选择至少一个文档")
+    tmp = DATA_DIR.parent / "tmp" / f"enhance-{sid}-{uuid.uuid4().hex[:8]}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        for f in files:
+            name = Path(f.filename).name   # 去掉路径，防穿越
+            if Path(name).suffix.lower() not in SUPPORTED:
+                raise HTTPException(400, f"{name}：不支持的格式（Word/PPT/Excel/PDF/HTML/MD/TXT）")
+            data = await f.read(MAX_FILE_BYTES + 1)
+            if len(data) > MAX_FILE_BYTES:
+                raise HTTPException(400, f"{name}：超过 20MB 上限")
+            (tmp / name).write_bytes(data)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    update_meta(sid, enhance_status="processing", enhance_error=None)
+    bg.add_task(enhance_task, sid, str(tmp))
+    log(f"📄 {sid} 收到 {len(files)} 份资料，开始生成增强纪要")
+    return RedirectResponse(f"/sessions/{sid}/enhanced", status_code=303)
+
+
+@app.get("/sessions/{sid}/enhanced", response_class=HTMLResponse, dependencies=[Depends(check_web)])
+def enhanced_page(sid: str):
+    meta = load_meta(sid)
+    st = meta.get("enhance_status", "")
+    title = html.escape(meta.get("title") or sid)
+    md_file = sdir(sid) / "enhanced.md"
+    if st == "processing":
+        body = ("<section class='status-card'><h1>正在生成增强纪要</h1>"
+                "<p>正在解析文档并调用大模型，约需 1 分钟。本页每 5 秒自动刷新。</p></section>")
+        return page("增强纪要生成中", body, refresh=5)
+    if st == "failed":
+        body = (f"<section class='status-card'><h1>生成失败</h1>"
+                f"<div class='error-box'>{html.escape(meta.get('enhance_error') or '未知错误')}</div>"
+                f"<a class='primary-button' href='/sessions/{sid}/enhance'>重新上传</a> "
+                f"<a class='secondary-button' href='/sessions/{sid}'>返回会议</a></section>")
+        return page("增强纪要失败", body)
+    if not md_file.exists():
+        return RedirectResponse(f"/sessions/{sid}/enhance", status_code=303)
+    import markdown
+    content = markdown.markdown(md_file.read_text(), extensions=["tables", "fenced_code"])
+    body = (f"<div class='page-heading'><div><div class='eyebrow'>ENHANCED MINUTES</div>"
+            f"<h1>增强版会议纪要</h1><p class='session-id'>{title} · 由 AI 结合会议资料生成</p></div></div>"
+            f"<p><a class='secondary-button' href='/sessions/{sid}'>← 原纪要</a> "
+            f"<a class='secondary-button' href='/sessions/{sid}/enhanced.md' download>下载 Markdown</a> "
+            f"<a class='secondary-button' href='/sessions/{sid}/enhance'>重新生成</a></p>"
+            f"<div class='status-card doc-body'>{content}</div>")
+    return page(f"增强纪要 · {meta.get('title') or sid}", body)
+
+
+@app.get("/sessions/{sid}/enhanced.md", dependencies=[Depends(check_web)])
+def enhanced_md(sid: str):
+    p = sdir(sid) / "enhanced.md"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(p, media_type="text/markdown; charset=utf-8", filename=f"{sid}-enhanced.md")
