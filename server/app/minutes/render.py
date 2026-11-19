@@ -22,7 +22,19 @@ from __future__ import annotations
 import html
 import re
 
-PALETTE = ["#2563eb", "#d97706", "#059669", "#db2777", "#7c3aed", "#0891b2", "#65a30d", "#dc2626"]
+PALETTE = ["#176b47", "#b7791f", "#2563eb", "#b34b75", "#7357b8", "#0f8091", "#6c8f2f", "#c65353"]
+
+BASE_CSS = """
+:root{--bg:#f4f5ef;--paper:#fff;--ink:#17221c;--dim:#647168;--line:#dfe3da;--accent:#176b47;--lime:#c9f277;--hl:#edf6df;--button-bg:#17221c;--button-text:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#111712;--paper:#1b241e;--ink:#edf3ee;--dim:#a2aea5;--line:#334138;--accent:#8fd4aa;--hl:#293522;--button-bg:#c9f277;--button-text:#17221c}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 Inter,-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:focus-visible,summary:focus-visible,button:focus-visible{outline:3px solid rgba(23,107,71,.3);outline-offset:3px}
+button{font:inherit}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+"""
 
 
 def _t(ms: int) -> str:
@@ -82,8 +94,9 @@ def render_html(m: dict) -> str:
 
     if m.get("actions"):
         rows = "".join(
-            f'<tr><td class="chk">☐</td><td>{_inline(a["text"])}</td>'
-            f'<td>{html.escape(a.get("owner") or "—")}</td><td>{html.escape(a.get("due") or "—")}</td></tr>'
+            f'<tr><td class="chk">☐</td><td data-label="事项">{_inline(a["text"])}</td>'
+            f'<td data-label="负责人">{html.escape(a.get("owner") or "—")}</td>'
+            f'<td data-label="截止">{html.escape(a.get("due") or "—")}</td></tr>'
             for a in m["actions"])
         sections.append(("actions", "待办事项",
                          f'<table class="todo"><thead><tr><th></th><th>事项</th><th>负责人</th><th>截止</th></tr>'
@@ -135,34 +148,65 @@ def render_html(m: dict) -> str:
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{html.escape(m.get("title", "会议纪要"))}</title><style>
-:root{{--bg:#f6f7f9;--paper:#fff;--ink:#1f2328;--dim:#6b7280;--line:#e5e7eb;--accent:#2563eb;--hl:#fff7e6}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#0f1115;--paper:#171a21;--ink:#e6e8eb;--dim:#9aa3ad;--line:#2a2f3a;--accent:#60a5fa;--hl:#2b2516}}}}
-*{{box-sizing:border-box}}body{{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}}
-.wrap{{max-width:1080px;margin:0 auto;padding:32px 16px;display:grid;grid-template-columns:180px 1fr;gap:28px}}
-nav{{position:sticky;top:24px;align-self:start;display:flex;flex-direction:column;gap:2px}}
-nav a{{color:var(--dim);text-decoration:none;padding:6px 10px;border-radius:6px;font-size:14px}}nav a:hover{{background:var(--paper);color:var(--ink)}}
-header,section{{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:22px 26px;margin-bottom:16px}}
-h1{{font-size:24px;margin:0 0 6px}}h2{{font-size:17px;margin:0 0 14px;padding-left:10px;border-left:3px solid var(--accent)}}h4{{margin:16px 0 6px;font-size:15px}}
-.meta-row{{color:var(--dim);font-size:13px;display:flex;flex-wrap:wrap;gap:18px}}
-.bars{{margin-top:14px;display:grid;gap:6px}}.bar{{display:grid;grid-template-columns:12px 72px 1fr 40px;align-items:center;gap:8px;font-size:13px}}
-.dot{{width:10px;height:10px;border-radius:50%}}.track{{height:6px;background:var(--line);border-radius:3px;overflow:hidden}}.track span{{display:block;height:100%}}.pct{{color:var(--dim);text-align:right}}
-.tags{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}}.tag{{background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent);padding:2px 10px;border-radius:999px;font-size:13px}}
-p{{margin:6px 0}}ul,ol{{margin:6px 0;padding-left:22px}}
-table.todo{{width:100%;border-collapse:collapse;font-size:14px}}.todo th,.todo td{{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top}}.todo th{{color:var(--dim);font-weight:500}}.chk{{width:24px;color:var(--dim)}}
-.timeline{{list-style:none;padding:0}}.timeline li{{display:grid;grid-template-columns:60px 1fr;gap:12px;padding:8px 0;border-bottom:1px dashed var(--line)}}
-.ts{{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums;margin-left:8px}}.timeline .ts{{margin:3px 0 0}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}}.card{{border:1px solid var(--line);border-top:3px solid var(--c);border-radius:10px;padding:12px 14px}}
-.who{{font-weight:600;display:flex;align-items:center;gap:6px}}.who i{{width:8px;height:8px;border-radius:50%;background:var(--c)}}
-details{{border-bottom:1px solid var(--line);padding:8px 0}}summary{{cursor:pointer;font-weight:600}}
-.seg{{padding:8px 10px;border-radius:8px}}.seg.hl{{background:var(--hl)}}.seg .meta{{font-size:13px;font-weight:600}}.mark{{margin-left:8px;color:#d97706;font-size:12px}}
-footer{{color:var(--dim);font-size:12px;text-align:center;padding:8px}}
-@media (max-width:760px){{.wrap{{grid-template-columns:1fr}}nav{{display:none}}header,section{{padding:18px 16px}}}}
-@media print{{nav{{display:none}}.wrap{{display:block}}body{{background:#fff}}}}
-</style></head><body><div class="wrap"><nav>{nav}</nav><main>
-<header><h1>{html.escape(m.get("title", "会议纪要"))}</h1>
-<div class="meta-row"><span>📅 {html.escape(m.get("date", ""))}</span><span>⏱ {_dur(m.get("duration_s", 0))}</span>
-<span>👥 {len(m.get("speakers", []))} 位发言人</span><span>★ {len(m.get("marks_ms", []))} 处重点</span></div>
+<title>{html.escape(m.get("title", "会议纪要"))} · Adhere</title><style>{BASE_CSS}
+body{{min-width:320px}}
+.topbar{{border-bottom:1px solid var(--line)}}
+.topbar-inner{{max-width:1180px;margin:auto;padding:19px 24px;display:flex;align-items:center;justify-content:space-between}}
+.brand{{display:inline-flex;align-items:center;gap:10px;color:var(--ink);font-size:20px;font-weight:750;letter-spacing:-.5px}}
+.brand-mark{{width:32px;height:32px;border-radius:10px;background:#17221c;display:flex;align-items:center;justify-content:center;gap:3px}}
+.brand-mark i{{display:block;width:3px;border-radius:3px;background:var(--lime)}}
+.brand-mark i:nth-child(1){{height:8px}}.brand-mark i:nth-child(2){{height:16px}}.brand-mark i:nth-child(3){{height:11px}}
+.doc-label{{color:var(--dim);font-size:11px;letter-spacing:1.8px}}
+.wrap{{max-width:1180px;margin:0 auto;padding:24px;display:grid;grid-template-columns:180px minmax(0,1fr);gap:24px}}
+nav{{position:sticky;top:20px;align-self:start;display:flex;flex-direction:column;gap:3px;padding:15px 12px;background:color-mix(in srgb,var(--paper) 75%,transparent);border:1px solid var(--line);border-radius:16px}}
+.nav-title{{padding:4px 10px 9px;color:var(--dim);font-size:10px;font-weight:700;letter-spacing:1.5px}}
+nav a{{color:var(--dim);padding:7px 10px;border-radius:8px;font-size:13px;white-space:nowrap}}nav a:hover{{background:var(--bg);color:var(--accent)}}
+main{{min-width:0}}
+.meeting-header,section{{background:var(--paper);border:1px solid var(--line);border-radius:20px;padding:28px 30px;margin-bottom:17px;box-shadow:0 10px 28px rgba(23,34,28,.035)}}
+.meeting-header{{padding:32px}}
+.eyebrow{{margin-bottom:11px;color:var(--accent);font-size:11px;font-weight:750;letter-spacing:1.8px}}
+h1{{margin:0 0 16px;font-size:clamp(27px,3.5vw,37px);line-height:1.3;letter-spacing:-1.2px;overflow-wrap:anywhere}}
+h2{{display:flex;align-items:center;gap:10px;margin:0 0 20px;font-size:19px;letter-spacing:-.3px}}h2::before{{content:"";width:4px;height:18px;border-radius:4px;background:var(--accent)}}
+h4{{margin:20px 0 8px;font-size:15px}}p{{margin:8px 0;line-height:1.85}}ul,ol{{margin:8px 0;padding-left:23px}}li{{margin:4px 0}}
+section{{scroll-margin-top:20px}}section,section *{{overflow-wrap:anywhere}}
+.meta-row{{display:flex;flex-wrap:wrap;gap:10px 22px;color:var(--dim);font-size:12px}}.meta-row b{{margin-right:5px;color:var(--ink);font-weight:550}}
+.bars{{margin-top:25px;padding-top:20px;border-top:1px solid var(--line);display:grid;gap:9px}}
+.bar{{display:grid;grid-template-columns:12px 84px minmax(60px,1fr) 38px;align-items:center;gap:9px;font-size:12px}}
+.dot{{width:9px;height:9px;border-radius:50%}}.nm{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.track{{height:6px;background:var(--line);border-radius:6px;overflow:hidden}}.track span{{display:block;height:100%;border-radius:6px}}.pct{{color:var(--dim);text-align:right;font-variant-numeric:tabular-nums}}
+.tags{{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:17px}}.tag{{background:color-mix(in srgb,var(--accent) 11%,transparent);color:var(--accent);padding:4px 11px;border-radius:99px;font-size:12px}}
+table.todo{{width:100%;border-collapse:collapse;font-size:14px}}.todo th,.todo td{{text-align:left;padding:13px 10px;border-bottom:1px solid var(--line);vertical-align:top}}
+.todo th{{color:var(--dim);font-size:12px;font-weight:550}}.todo tr:last-child td{{border-bottom:0}}.chk{{width:28px;color:var(--dim)}}
+.timeline{{list-style:none;padding:0}}.timeline li{{position:relative;display:grid;grid-template-columns:58px 1fr;gap:15px;padding:13px 0;border-bottom:1px dashed var(--line)}}
+.timeline li:last-child{{border-bottom:0}}.timeline b{{font-size:14px}}.timeline p{{color:var(--dim);font-size:13px}}
+.ts{{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums;margin-left:8px}}.timeline .ts{{margin:4px 0 0;color:var(--accent);font-weight:650}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:13px}}
+.card{{padding:17px 18px;border:1px solid var(--line);border-top:3px solid var(--c);border-radius:14px;background:color-mix(in srgb,var(--paper) 90%,var(--bg))}}
+.who{{display:flex;align-items:center;gap:7px;font-weight:650}}.who i{{width:8px;height:8px;border-radius:50%;background:var(--c)}}.card p{{color:var(--dim);font-size:13px}}
+details{{border-bottom:1px solid var(--line);padding:12px 0}}details:last-child{{border-bottom:0}}summary{{cursor:pointer;font-weight:650;line-height:1.6}}details p{{color:var(--dim)}}
+.seg{{padding:13px 15px;border-radius:12px}}.seg+.seg{{margin-top:5px}}.seg.hl{{background:var(--hl);box-shadow:inset 3px 0 0 var(--accent)}}
+.seg .meta{{display:flex;align-items:center;flex-wrap:wrap;font-size:12px;font-weight:650}}.seg p{{margin:5px 0 0}}.mark{{margin-left:8px;color:#a66a13;font-size:11px}}
+footer{{color:var(--dim);font-size:11px;text-align:center;line-height:1.8;padding:15px 10px 30px}}
+@media (max-width:760px){{
+.topbar-inner{{padding:16px 18px}}.doc-label{{display:none}}.wrap{{display:block;padding:14px}}
+nav{{position:static;flex-direction:row;overflow-x:auto;gap:4px;margin-bottom:14px;padding:7px;border-radius:13px;scrollbar-width:thin}}.nav-title{{display:none}}nav a{{flex:0 0 auto;padding:8px 11px}}
+.meeting-header,section{{padding:22px 18px;border-radius:17px}}.meeting-header{{padding:25px 21px}}h1{{letter-spacing:-.7px}}h2{{font-size:18px;margin-bottom:16px}}
+.meta-row{{display:grid;grid-template-columns:1fr 1fr;gap:9px 14px}}.bar{{grid-template-columns:10px 70px minmax(50px,1fr) 34px;gap:7px}}
+.todo thead{{display:none}}.todo,.todo tbody,.todo tr,.todo td{{display:block;width:100%}}.todo tr{{padding:13px 0;border-bottom:1px solid var(--line)}}.todo tr:last-child{{border-bottom:0}}
+.todo td{{display:flex;justify-content:space-between;gap:20px;padding:4px 0;border:0;text-align:right}}.todo td::before{{content:attr(data-label);color:var(--dim);font-size:12px;white-space:nowrap}}
+.todo td.chk{{display:none}}.todo td:nth-child(2){{display:block;margin-bottom:6px;text-align:left;font-weight:650}}.todo td:nth-child(2)::before{{display:none}}
+.timeline li{{grid-template-columns:48px 1fr;gap:11px}}.cards{{grid-template-columns:1fr}}.seg{{padding:12px}}
+}}
+@media print{{
+.topbar,nav{{display:none}}body{{background:#fff}}.wrap{{display:block;max-width:none;padding:0}}.meeting-header,section{{padding:16px 0;border:0;border-bottom:1px solid #ddd;border-radius:0;box-shadow:none;break-inside:avoid}}
+.seg{{break-inside:avoid}}footer{{padding-bottom:0}}
+}}
+</style></head><body>
+<header class="topbar"><div class="topbar-inner"><a class="brand" href="/" aria-label="返回会议记录"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>adhere</a><span class="doc-label">MEETING NOTES</span></div></header>
+<div class="wrap"><nav aria-label="纪要章节"><span class="nav-title">本页目录</span>{nav}</nav><main>
+<header class="meeting-header"><div class="eyebrow">AI MEETING NOTES</div><h1>{html.escape(m.get("title", "会议纪要"))}</h1>
+<div class="meta-row"><span><b>日期</b>{html.escape(m.get("date", ""))}</span><span><b>时长</b>{_dur(m.get("duration_s", 0))}</span>
+<span><b>发言人</b>{len(m.get("speakers", []))} 位</span><span><b>重点</b>{len(m.get("marks_ms", []))} 处</span></div>
 <div class="bars">{bars}</div></header>
 {body}
 <footer>由 {html.escape(m.get("engine", ""))} 生成 · 内容仅依据会议录音整理，请核对后再分发</footer>
