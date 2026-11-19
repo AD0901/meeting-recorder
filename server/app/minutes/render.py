@@ -39,6 +39,7 @@ button{font:inherit}
 
 INTERACTION_CSS = """
 [hidden]{display:none!important}
+.section-fold{border-bottom:0;padding:0}.section-fold>summary{display:flex;align-items:center;gap:14px;list-style:none}.section-fold>summary::-webkit-details-marker{display:none}.section-fold>summary h2{flex:1;margin:0}.section-fold>summary::after{content:"展开";flex-shrink:0;padding:5px 11px;border:1px solid var(--line);border-radius:99px;color:var(--accent);font-size:11px;font-weight:650}.section-fold[open]>summary::after{content:"收起"}.fold-count{margin-left:auto;color:var(--dim);font-size:11px;font-weight:400;letter-spacing:0}.fold-content{padding-top:20px}.section-fold[open]>summary{padding-bottom:16px;border-bottom:1px solid var(--line)}
 .meeting-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.meeting-title-row h1{flex:1}
 .meeting-actions{flex-shrink:0;padding-top:4px}.tool-button{display:inline-flex;align-items:center;justify-content:center;padding:10px 16px;border:1px solid var(--button-bg);border-radius:10px;background:var(--button-bg);color:var(--button-text);cursor:pointer;font-size:13px;font-weight:650;white-space:nowrap}.tool-button.secondary{border-color:var(--line);background:var(--paper);color:var(--ink)}.tool-button:disabled,.quick-questions button:disabled{cursor:not-allowed;opacity:.45}
 .assistant-section h2{margin-bottom:8px}.llm-badge{display:inline-flex;align-items:center;margin-left:4px;padding:3px 8px;border-radius:99px;background:color-mix(in srgb,var(--accent) 11%,transparent);color:var(--accent);font-size:10px;font-weight:650;letter-spacing:0;vertical-align:middle}.assistant-intro{margin:0;color:var(--dim);font-size:13px}.privacy-hint{margin:12px 0 0;color:var(--dim);font-size:11px;line-height:1.7}
@@ -47,7 +48,7 @@ INTERACTION_CSS = """
 .ask-form{margin-top:14px}.ask-input-row{display:flex;align-items:flex-end;gap:10px}.ask-input-row textarea{flex:1;min-height:54px;max-height:180px;resize:vertical}.ask-form textarea,.minutes-editor input,.minutes-editor textarea{width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font:inherit;line-height:1.65}.ask-form textarea:focus,.minutes-editor input:focus,.minutes-editor textarea:focus{border-color:var(--accent);outline:3px solid color-mix(in srgb,var(--accent) 15%,transparent)}.ask-status{min-height:20px;margin:8px 0 0;color:var(--dim);font-size:12px}.ask-shortcut{color:var(--dim);font-size:11px}
 .minutes-editor{margin-bottom:17px}.editor-intro{margin:-8px 0 20px;color:var(--dim);font-size:13px}.edit-group{margin:0 0 13px;padding:0 17px;border:1px solid var(--line);border-radius:13px}.edit-group summary{padding:14px 0}.edit-fields{padding:0 0 17px}.edit-field{display:grid;gap:6px;margin-bottom:14px}.edit-field:last-child{margin-bottom:0}.edit-field>span,.edit-label{color:var(--dim);font-size:12px;font-weight:600}.edit-field textarea{min-height:92px;resize:vertical}.edit-field textarea.tall{min-height:150px}.edit-item{padding:15px 0;border-top:1px solid var(--line)}.edit-item:first-child{border-top:0}.edit-item-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;color:var(--dim);font-size:12px;font-weight:650}.edit-item textarea{min-height:72px;margin-top:7px;resize:vertical}.edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.edit-empty{color:var(--dim);font-size:13px}.editor-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:20px}.form-error{margin:12px 0 0;padding:11px 13px;border-radius:10px;background:#fff0ed;color:#9e4038;font-size:12px}.wrap.editing{grid-template-columns:minmax(0,1fr)}.wrap.editing nav{display:none}
 @media (max-width:760px){.meeting-title-row{gap:12px}.meeting-actions{padding-top:0}.chat-message{max-width:96%}.ask-input-row{align-items:stretch;flex-direction:column}.ask-input-row .tool-button{width:100%}.edit-grid{grid-template-columns:1fr}.ask-shortcut{display:none}}
-@media print{.assistant-section,.minutes-editor,.meeting-actions{display:none!important}}
+@media print{.assistant-section,.minutes-editor,.meeting-actions{display:none!important}.section-fold:not([open])>.fold-content{display:block!important}.section-fold>summary::after{display:none}}
 """
 
 INTERACTION_SCRIPT = r"""
@@ -385,7 +386,7 @@ def render_html(m: dict, *, session_id: str | None = None, enhance_status: str =
         sections.append(("speakers", "发言总结", f'<div class="cards">{cards}</div>'))
 
     if m.get("qa"):
-        qa = "".join(f'<details open><summary>{_inline(q["q"])}</summary><p>{_inline(q["a"])}</p></details>'
+        qa = "".join(f'<details><summary>{_inline(q["q"])}</summary><p>{_inline(q["a"])}</p></details>'
                      for q in m["qa"])
         sections.append(("qa", "问答回顾", qa))
 
@@ -410,7 +411,17 @@ def render_html(m: dict, *, session_id: str | None = None, enhance_status: str =
         f'background:{color[s["name"]]}"></span></span><span class="pct">{100 * s.get("talk_s", 0) / total_talk:.0f}%</span></div>'
         for s in m.get("speakers", []))
     nav = "".join(f'<a href="#{sid}">{t}</a>' for sid, t, _ in sections)
-    body = "".join(f'<section id="{sid}"><h2>{t}</h2>{h}</section>' for sid, t, h in sections)
+    rendered_sections = []
+    fold_counts = {"qa": f'{len(m.get("qa", []))} 条问答', "transcript": f'{len(m.get("transcript", []))} 段发言'}
+    for section_id, title, content in sections:
+        if section_id in fold_counts:
+            rendered_sections.append(
+                f'<section id="{section_id}" class="fold-section"><details class="section-fold">'
+                f'<summary><h2>{title}<span class="fold-count">{fold_counts[section_id]}</span></h2></summary>'
+                f'<div class="fold-content">{content}</div></details></section>')
+        else:
+            rendered_sections.append(f'<section id="{section_id}"><h2>{title}</h2>{content}</section>')
+    body = "".join(rendered_sections)
     enhancement = ""
     if session_id:
         label, description, action, path, cls = {
