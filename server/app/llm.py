@@ -26,6 +26,16 @@ SYSTEM_PROMPT = """你是一名严谨的会议纪要助手。用户会给你三�
 - 打点标记的段落是会议发起人认为重要的内容，如材料中有打点信息请重点关注
 - 直接输出 Markdown 正文，不要寒暄"""
 
+QA_SYSTEM_PROMPT = """你是一名严谨的会议纪要问答助手。请根据系统提供的当前会议纪要和全文转写回答用户问题。
+
+要求：
+- 只依据会议材料回答，可以归纳、比较和提取，但不要用外部知识补全事实，禁止编造人名、数据、决议或待办
+- 用户人工修改后的纪要优先于原始转写；两者有出入时，以修改后的纪要为准
+- 涉及具体观点、决议或待办时，尽量注明对应发言人和时间；材料里没有就不要补充
+- 材料没有提及或无法确定时，直接说明“会议材料中未提及”或“根据现有内容无法确定”
+- 默认用简洁的中文回答，必要时分点；不要复述整份纪要，不要寒暄
+"""
+
 
 def llm_ready() -> bool:
     return bool(LLM_BASE_URL and LLM_API_KEY)
@@ -87,3 +97,36 @@ def enhance_minutes(minutes: dict, docs: list[tuple[str, str]]) -> str:
     content = data["choices"][0]["message"]["content"]
     usage = data.get("usage", {})
     return content, usage
+
+
+def answer_minutes_question(minutes: dict, question: str, history: list[dict]) -> tuple[str, dict]:
+    """把最新纪要和转写作为上下文，使用已配置的大模型进行多轮问答。"""
+    if not llm_ready():
+        raise RuntimeError("未配置 LLM_API_KEY，无法使用纪要问答")
+
+    current = {k: minutes.get(k) for k in
+               ("title", "date", "summary", "keywords", "key_points", "actions", "next_steps",
+                "chapters", "speaker_summaries", "qa", "marks_ms")}
+    context = (
+        QA_SYSTEM_PROMPT
+        + "\n\n【当前会议纪要】\n" + json.dumps(current, ensure_ascii=False, indent=1)
+        + "\n\n【会议全文转写】\n" + _fmt_transcript(minutes)
+    )
+    messages = [{"role": "system", "content": context}]
+    messages.extend({"role": item["role"], "content": item["content"]} for item in history)
+    messages.append({"role": "user", "content": question})
+
+    r = requests.post(
+        f"{LLM_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+        json={
+            "model": LLM_MODEL,
+            "messages": messages,
+            "max_tokens": 8000,
+        },
+        timeout=180,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"LLM 接口返回 {r.status_code}：{r.text[:300]}")
+    data = r.json()
+    return data["choices"][0]["message"]["content"], data.get("usage", {})

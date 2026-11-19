@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 
 PALETTE = ["#176b47", "#b7791f", "#2563eb", "#b34b75", "#7357b8", "#0f8091", "#6c8f2f", "#c65353"]
@@ -34,6 +35,202 @@ a{color:var(--accent);text-decoration:none}
 a:focus-visible,summary:focus-visible,button:focus-visible{outline:3px solid rgba(23,107,71,.3);outline-offset:3px}
 button{font:inherit}
 @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+"""
+
+INTERACTION_CSS = """
+[hidden]{display:none!important}
+.meeting-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.meeting-title-row h1{flex:1}
+.meeting-actions{flex-shrink:0;padding-top:4px}.tool-button{display:inline-flex;align-items:center;justify-content:center;padding:10px 16px;border:1px solid var(--button-bg);border-radius:10px;background:var(--button-bg);color:var(--button-text);cursor:pointer;font-size:13px;font-weight:650;white-space:nowrap}.tool-button.secondary{border-color:var(--line);background:var(--paper);color:var(--ink)}.tool-button:disabled,.quick-questions button:disabled{cursor:not-allowed;opacity:.45}
+.assistant-section h2{margin-bottom:8px}.llm-badge{display:inline-flex;align-items:center;margin-left:4px;padding:3px 8px;border-radius:99px;background:color-mix(in srgb,var(--accent) 11%,transparent);color:var(--accent);font-size:10px;font-weight:650;letter-spacing:0;vertical-align:middle}.assistant-intro{margin:0;color:var(--dim);font-size:13px}.privacy-hint{margin:12px 0 0;color:var(--dim);font-size:11px;line-height:1.7}
+.chat-log{display:grid;gap:12px;max-height:520px;margin-top:18px;overflow-y:auto}.chat-empty{padding:20px;border:1px dashed var(--line);border-radius:12px;color:var(--dim);font-size:13px;text-align:center}.chat-message{max-width:88%;padding:13px 16px;border-radius:14px;background:var(--bg)}.chat-message.user{justify-self:end;background:color-mix(in srgb,var(--accent) 12%,var(--paper))}.chat-message.assistant{justify-self:start;border:1px solid var(--line);background:color-mix(in srgb,var(--paper) 90%,var(--bg))}.chat-message.error{max-width:100%;background:#fff0ed;color:#9e4038}.message-role{margin-bottom:4px;color:var(--dim);font-size:11px;font-weight:650}.message-text{line-height:1.8;white-space:pre-wrap}
+.quick-questions{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}.quick-questions button{padding:6px 10px;border:1px solid var(--line);border-radius:99px;background:var(--paper);color:var(--accent);cursor:pointer;font-size:11px}.quick-questions button:hover{border-color:var(--accent)}
+.ask-form{margin-top:14px}.ask-input-row{display:flex;align-items:flex-end;gap:10px}.ask-input-row textarea{flex:1;min-height:54px;max-height:180px;resize:vertical}.ask-form textarea,.minutes-editor input,.minutes-editor textarea{width:100%;padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:var(--bg);color:var(--ink);font:inherit;line-height:1.65}.ask-form textarea:focus,.minutes-editor input:focus,.minutes-editor textarea:focus{border-color:var(--accent);outline:3px solid color-mix(in srgb,var(--accent) 15%,transparent)}.ask-status{min-height:20px;margin:8px 0 0;color:var(--dim);font-size:12px}.ask-shortcut{color:var(--dim);font-size:11px}
+.minutes-editor{margin-bottom:17px}.editor-intro{margin:-8px 0 20px;color:var(--dim);font-size:13px}.edit-group{margin:0 0 13px;padding:0 17px;border:1px solid var(--line);border-radius:13px}.edit-group summary{padding:14px 0}.edit-fields{padding:0 0 17px}.edit-field{display:grid;gap:6px;margin-bottom:14px}.edit-field:last-child{margin-bottom:0}.edit-field>span,.edit-label{color:var(--dim);font-size:12px;font-weight:600}.edit-field textarea{min-height:92px;resize:vertical}.edit-field textarea.tall{min-height:150px}.edit-item{padding:15px 0;border-top:1px solid var(--line)}.edit-item:first-child{border-top:0}.edit-item-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;color:var(--dim);font-size:12px;font-weight:650}.edit-item textarea{min-height:72px;margin-top:7px;resize:vertical}.edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.edit-empty{color:var(--dim);font-size:13px}.editor-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:20px}.form-error{margin:12px 0 0;padding:11px 13px;border-radius:10px;background:#fff0ed;color:#9e4038;font-size:12px}.wrap.editing{grid-template-columns:minmax(0,1fr)}.wrap.editing nav{display:none}
+@media (max-width:760px){.meeting-title-row{gap:12px}.meeting-actions{padding-top:0}.chat-message{max-width:96%}.ask-input-row{align-items:stretch;flex-direction:column}.ask-input-row .tool-button{width:100%}.edit-grid{grid-template-columns:1fr}.ask-shortcut{display:none}}
+@media print{.assistant-section,.minutes-editor,.meeting-actions{display:none!important}}
+"""
+
+INTERACTION_SCRIPT = r"""
+<script>
+(() => {
+  const sessionId = __SESSION_ID__;
+  const editToggle = document.getElementById('edit-toggle');
+  const editor = document.getElementById('minutes-editor');
+  const minutesView = document.getElementById('minutes-view');
+  const editForm = document.getElementById('edit-form');
+  const saveButton = document.getElementById('save-minutes');
+  const editError = document.getElementById('edit-error');
+
+  function setEditing(active) {
+    editor.hidden = !active;
+    minutesView.hidden = active;
+    document.querySelector('.wrap').classList.toggle('editing', active);
+    editToggle.textContent = active ? '取消编辑' : '编辑纪要';
+    editToggle.setAttribute('aria-expanded', String(active));
+    if (active) editor.scrollIntoView({block: 'start'});
+  }
+
+  function cancelEditing() {
+    editForm.reset();
+    editor.querySelectorAll('.edit-action[data-added="true"]').forEach(item => item.remove());
+    editError.hidden = true;
+    setEditing(false);
+  }
+
+  editToggle.addEventListener('click', () => editor.hidden ? setEditing(true) : cancelEditing());
+  document.getElementById('cancel-edit').addEventListener('click', cancelEditing);
+
+  document.getElementById('add-action').addEventListener('click', () => {
+    const template = document.getElementById('action-template');
+    const item = template.content.firstElementChild.cloneNode(true);
+    document.getElementById('edit-actions').appendChild(item);
+    item.querySelector('textarea').focus();
+  });
+
+  async function responseError(response) {
+    try {
+      const data = await response.json();
+      if (typeof data.detail === 'string') return data.detail;
+    } catch (_) {}
+    return `请求失败（${response.status}）`;
+  }
+
+  function field(item, name) {
+    return item.querySelector(`[data-field="${name}"]`).value;
+  }
+
+  function collectMinutes() {
+    const value = id => document.getElementById(id).value;
+    const actions = Array.from(editor.querySelectorAll('.edit-action')).map(item => ({
+      text: field(item, 'text').trim(), owner: field(item, 'owner').trim(), due: field(item, 'due').trim(),
+    })).filter(item => item.text);
+    const chapters = Array.from(editor.querySelectorAll('.edit-chapter')).map(item => ({
+      start_ms: Number(item.dataset.startMs) || 0,
+      end_ms: Number(item.dataset.endMs) || 0,
+      title: field(item, 'title').trim(), summary: field(item, 'summary').trim(),
+    })).filter(item => item.title || item.summary);
+    const speakerSummaries = Array.from(editor.querySelectorAll('.edit-speaker')).map(item => ({
+      speaker: item.dataset.speaker, summary: field(item, 'summary').trim(),
+    })).filter(item => item.summary);
+    const qa = Array.from(editor.querySelectorAll('.edit-qa')).map(item => ({
+      q: field(item, 'q').trim(), a: field(item, 'a').trim(),
+    })).filter(item => item.q || item.a);
+    const transcript = Array.from(editor.querySelectorAll('.edit-transcript')).map(item => ({
+      speaker: item.dataset.speaker, start_ms: Number(item.dataset.startMs) || 0, text: field(item, 'text').trim(),
+    })).filter(item => item.text);
+    return {
+      title: value('edit-title'),
+      keywords: value('edit-keywords').split(/[，,、\n]/).map(text => text.trim()).filter(Boolean),
+      summary: value('edit-summary').trim(),
+      key_points: value('edit-key-points').split('\n').map(text => text.trim()).filter(Boolean),
+      actions,
+      next_steps: value('edit-next-steps').trim(),
+      chapters,
+      speaker_summaries: speakerSummaries,
+      qa,
+      transcript,
+    };
+  }
+
+  editForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    saveButton.disabled = true;
+    saveButton.textContent = '正在保存…';
+    editError.hidden = true;
+    try {
+      const response = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/minutes', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(collectMinutes()),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      saveButton.textContent = '已保存';
+      window.location.reload();
+    } catch (error) {
+      editError.textContent = error.message || '保存失败，请稍后重试';
+      editError.hidden = false;
+      saveButton.disabled = false;
+      saveButton.textContent = '保存修改';
+    }
+  });
+
+  const askForm = document.getElementById('ask-form');
+  const askInput = document.getElementById('ask-input');
+  const askButton = document.getElementById('ask-submit');
+  const askStatus = document.getElementById('ask-status');
+  const chatLog = document.getElementById('chat-log');
+  const chatEmpty = document.getElementById('chat-empty');
+  const quickButtons = Array.from(document.querySelectorAll('[data-question]'));
+  const history = [];
+  let askBusy = false;
+
+  function addMessage(role, text) {
+    chatEmpty.hidden = true;
+    const item = document.createElement('article');
+    item.className = `chat-message ${role}`;
+    const label = document.createElement('div');
+    label.className = 'message-role';
+    label.textContent = role === 'user' ? '你' : (role === 'assistant' ? 'AI 纪要助手' : '提示');
+    const content = document.createElement('div');
+    content.className = 'message-text';
+    content.textContent = text;
+    item.append(label, content);
+    chatLog.appendChild(item);
+    chatLog.scrollTop = chatLog.scrollHeight;
+  }
+
+  function setAskBusy(busy) {
+    askBusy = busy;
+    askButton.disabled = busy;
+    askInput.disabled = busy;
+    quickButtons.forEach(button => { button.disabled = busy; });
+    askButton.textContent = busy ? '大模型思考中…' : '提问';
+    askStatus.textContent = busy ? '正在结合当前纪要和全文转写生成回答…' : '';
+  }
+
+  askForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (askBusy) return;
+    const question = askInput.value.trim();
+    if (!question) return;
+    const requestHistory = history.slice(-12);
+    addMessage('user', question);
+    askInput.value = '';
+    setAskBusy(true);
+    try {
+      const response = await fetch('/api/sessions/' + encodeURIComponent(sessionId) + '/ask', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({question, history: requestHistory}),
+      });
+      if (!response.ok) throw new Error(await responseError(response));
+      const data = await response.json();
+      const answer = data.answer || '大模型未返回答案，请重试。';
+      addMessage('assistant', answer);
+      history.push({role: 'user', content: question}, {role: 'assistant', content: answer});
+      if (history.length > 12) history.splice(0, history.length - 12);
+    } catch (error) {
+      addMessage('error', error.message || '问答失败，请稍后重试');
+      askInput.value = question;
+    } finally {
+      setAskBusy(false);
+      askInput.focus();
+    }
+  });
+
+  quickButtons.forEach(button => button.addEventListener('click', () => {
+    if (askBusy) return;
+    askInput.value = button.dataset.question;
+    askForm.requestSubmit();
+  }));
+  askInput.addEventListener('keydown', event => {
+    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+      event.preventDefault();
+      askForm.requestSubmit();
+    }
+  });
+})();
+</script>
 """
 
 
@@ -80,7 +277,76 @@ def _md(text: str) -> str:
     return "\n".join(out)
 
 
-def render_html(m: dict) -> str:
+def _e(value) -> str:
+    return html.escape(str(value or ""))
+
+
+def _action_editor(action: dict, *, added: bool = False) -> str:
+    added_attr = ' data-added="true"' if added else ""
+    return f"""<div class="edit-item edit-action"{added_attr}>
+<label class="edit-field"><span>事项（清空后保存可删除）</span><textarea data-field="text" rows="2">{_e(action.get('text'))}</textarea></label>
+<div class="edit-grid"><label class="edit-field"><span>负责人</span><input data-field="owner" value="{_e(action.get('owner'))}"></label>
+<label class="edit-field"><span>截止时间</span><input data-field="due" value="{_e(action.get('due'))}"></label></div></div>"""
+
+
+def _editor_html(m: dict) -> str:
+    actions = "".join(_action_editor(a) for a in m.get("actions", []))
+    chapters = "".join(f"""<div class="edit-item edit-chapter" data-start-ms="{int(c.get('start_ms', 0))}" data-end-ms="{int(c.get('end_ms', 0))}">
+<div class="edit-item-head"><span>{_t(c.get('start_ms', 0))}</span><span>时间点保留不变</span></div>
+<label class="edit-field"><span>章节标题</span><input data-field="title" value="{_e(c.get('title'))}"></label>
+<label class="edit-field"><span>章节摘要</span><textarea data-field="summary">{_e(c.get('summary'))}</textarea></label></div>"""
+                       for c in m.get("chapters", []))
+    speaker_summaries = "".join(f"""<div class="edit-item edit-speaker" data-speaker="{_e(s.get('speaker'))}">
+<div class="edit-item-head"><span>{_e(s.get('speaker'))}</span></div>
+<textarea data-field="summary" aria-label="{_e(s.get('speaker'))}的发言总结">{_e(s.get('summary'))}</textarea></div>"""
+                                for s in m.get("speaker_summaries", []))
+    qa = "".join(f"""<div class="edit-item edit-qa"><label class="edit-field"><span>问题</span><textarea data-field="q">{_e(q.get('q'))}</textarea></label>
+<label class="edit-field"><span>回答</span><textarea data-field="a">{_e(q.get('a'))}</textarea></label></div>"""
+                 for q in m.get("qa", []))
+    transcript = "".join(f"""<div class="edit-item edit-transcript" data-speaker="{_e(s.get('speaker'))}" data-start-ms="{int(s.get('start_ms', 0))}">
+<div class="edit-item-head"><span>{_e(s.get('speaker'))}</span><span>{_t(s.get('start_ms', 0))}</span></div>
+<textarea data-field="text" aria-label="{_e(s.get('speaker'))}在{_t(s.get('start_ms', 0))}的转写">{_e(s.get('text'))}</textarea></div>"""
+                         for s in m.get("transcript", []))
+    empty = '<p class="edit-empty">暂无内容。</p>'
+    return f"""<section id="minutes-editor" class="minutes-editor" hidden aria-labelledby="editor-title">
+<h2 id="editor-title">编辑会议纪要</h2><p class="editor-intro">直接校正识别错误或补充信息。保存后，页面和后续 AI 问答都会使用修改后的内容。</p>
+<form id="edit-form">
+<details class="edit-group" open><summary>标题、摘要与要点</summary><div class="edit-fields">
+<label class="edit-field"><span>会议标题</span><input id="edit-title" maxlength="200" value="{_e(m.get('title'))}" required></label>
+<label class="edit-field"><span>关键词（用逗号或换行分隔）</span><input id="edit-keywords" value="{_e('、'.join(m.get('keywords', [])))}"></label>
+<label class="edit-field"><span>会议摘要（支持 Markdown 列表）</span><textarea id="edit-summary" class="tall">{_e(m.get('summary'))}</textarea></label>
+<label class="edit-field"><span>要点（每行一条）</span><textarea id="edit-key-points">{_e(chr(10).join(m.get('key_points', [])))}</textarea></label>
+<label class="edit-field"><span>下一步规划（支持 Markdown 列表）</span><textarea id="edit-next-steps">{_e(m.get('next_steps'))}</textarea></label>
+</div></details>
+<details class="edit-group"><summary>待办事项</summary><div class="edit-fields"><div id="edit-actions">{actions or empty}</div>
+<button id="add-action" class="tool-button secondary" type="button">添加待办</button></div></details>
+<details class="edit-group"><summary>章节速览</summary><div class="edit-fields">{chapters or empty}</div></details>
+<details class="edit-group"><summary>发言总结</summary><div class="edit-fields">{speaker_summaries or empty}</div></details>
+<details class="edit-group"><summary>问答回顾</summary><div class="edit-fields">{qa or empty}</div></details>
+<details class="edit-group"><summary>会议全文转写</summary><div class="edit-fields">{transcript or empty}</div></details>
+<div class="editor-actions"><button id="save-minutes" class="tool-button" type="submit">保存修改</button>
+<button id="cancel-edit" class="tool-button secondary" type="button">取消</button></div>
+<p id="edit-error" class="form-error" role="alert" hidden></p></form>
+<template id="action-template">{_action_editor({}, added=True)}</template></section>"""
+
+
+def _assistant_html(enabled: bool) -> str:
+    disabled = "" if enabled else " disabled"
+    unavailable = "" if enabled else '<p class="form-error">服务端还没配置 LLM_API_KEY，配置并重启服务后即可使用大模型问答。</p>'
+    return f"""<section id="assistant" class="assistant-section"><h2>AI 纪要问答 <span class="llm-badge">大模型</span></h2>
+<p class="assistant-intro">直接询问这场会议的结论、依据和细节，也可以接着上一个回答继续追问。</p>{unavailable}
+<div id="chat-log" class="chat-log" aria-live="polite"><div id="chat-empty" class="chat-empty">还没有提问。可以从下面的快捷问题开始。</div></div>
+<div class="quick-questions"><button type="button" data-question="这场会议做出了哪些明确决定？"{disabled}>做出了哪些决定？</button>
+<button type="button" data-question="请汇总这场会议的待办事项、负责人和时间。"{disabled}>汇总待办事项</button>
+<button type="button" data-question="哪些问题在会议结束时仍没有解决？"{disabled}>还有哪些遗留问题？</button></div>
+<form id="ask-form" class="ask-form"><div class="ask-input-row"><textarea id="ask-input" rows="2" maxlength="2000" required placeholder="输入关于这场会议的问题…" aria-label="向大模型提问"{disabled}></textarea>
+<button id="ask-submit" class="tool-button" type="submit"{disabled}>提问</button></div>
+<p id="ask-status" class="ask-status" aria-live="polite"></p><span class="ask-shortcut">Command / Ctrl + Enter 发送</span></form>
+<p class="privacy-hint">提问时，当前纪要、全文转写和本次对话会发送给服务端已配置的大模型；AI 回答可能出错，请结合原文核对。</p></section>"""
+
+
+def render_html(m: dict, *, session_id: str | None = None, enhance_status: str = "",
+                assistant_enabled: bool = False) -> str:
     color = {s["name"]: PALETTE[i % len(PALETTE)] for i, s in enumerate(m.get("speakers", []))}
     total_talk = sum(s.get("talk_s", 0) for s in m.get("speakers", [])) or 1
     sections: list[tuple[str, str, str]] = []  # (id, 标题, html)
@@ -145,6 +411,24 @@ def render_html(m: dict) -> str:
         for s in m.get("speakers", []))
     nav = "".join(f'<a href="#{sid}">{t}</a>' for sid, t, _ in sections)
     body = "".join(f'<section id="{sid}"><h2>{t}</h2>{h}</section>' for sid, t, h in sections)
+    enhancement = ""
+    if session_id:
+        label, description, action, path, cls = {
+            "done": ("这份会议已生成资料增强版", "结合会议讨论与上传资料，查看信息更完整的增强纪要。", "查看增强纪要", "enhanced", "done"),
+            "processing": ("正在生成资料增强版", "资料已上传，服务器正在解析并生成增强纪要。", "查看生成进度", "enhanced", "processing"),
+            "failed": ("增强纪要生成失败", "可以重新上传会议资料，再次生成增强纪要。", "重新上传资料", "enhanced", "failed"),
+        }.get(enhance_status, ("用会议资料增强这份纪要", "上传 Word、PPT、Excel、PDF 等资料，补充讨论中的背景、数据和目标。", "上传会议资料", "enhance", ""))
+        enhancement = (f'<aside class="enhance-banner {cls}"><div><strong>{label}</strong><p>{description}</p></div>'
+                       f'<a href="/sessions/{html.escape(session_id, quote=True)}/{path}">{action}<span aria-hidden="true"> →</span></a></aside>')
+
+    editor, assistant, edit_button, interaction_script = "", "", "", ""
+    if session_id:
+        editor = _editor_html(m)
+        assistant = _assistant_html(assistant_enabled)
+        edit_button = ('<div class="meeting-actions"><button id="edit-toggle" class="tool-button secondary" '
+                       'type="button" aria-controls="minutes-editor" aria-expanded="false">编辑纪要</button></div>')
+        interaction_script = INTERACTION_SCRIPT.replace("__SESSION_ID__", json.dumps(session_id))
+        nav = '<a href="#assistant">AI 问答</a>' + nav
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -187,6 +471,8 @@ details{{border-bottom:1px solid var(--line);padding:12px 0}}details:last-child{
 .seg{{padding:13px 15px;border-radius:12px}}.seg+.seg{{margin-top:5px}}.seg.hl{{background:var(--hl);box-shadow:inset 3px 0 0 var(--accent)}}
 .seg .meta{{display:flex;align-items:center;flex-wrap:wrap;font-size:12px;font-weight:650}}.seg p{{margin:5px 0 0}}.mark{{margin-left:8px;color:#a66a13;font-size:11px}}
 footer{{color:var(--dim);font-size:11px;text-align:center;line-height:1.8;padding:15px 10px 30px}}
+.enhance-banner{{display:flex;align-items:center;justify-content:space-between;gap:22px;margin-bottom:17px;padding:20px 22px;border:1px solid color-mix(in srgb,var(--accent) 22%,var(--line));border-radius:17px;background:color-mix(in srgb,var(--accent) 7%,var(--paper))}}
+.enhance-banner strong{{font-size:14px}}.enhance-banner p{{margin:4px 0 0;color:var(--dim);font-size:12px;line-height:1.65}}.enhance-banner a{{flex-shrink:0;padding:9px 13px;border-radius:10px;background:var(--button-bg);color:var(--button-text);font-size:12px;font-weight:650}}.enhance-banner.processing{{background:color-mix(in srgb,#fff1d6 60%,var(--paper))}}.enhance-banner.failed{{background:color-mix(in srgb,#fde8e5 55%,var(--paper))}}
 @media (max-width:760px){{
 .topbar-inner{{padding:16px 18px}}.doc-label{{display:none}}.wrap{{display:block;padding:14px}}
 nav{{position:static;flex-direction:row;overflow-x:auto;gap:4px;margin-bottom:14px;padding:7px;border-radius:13px;scrollbar-width:thin}}.nav-title{{display:none}}nav a{{flex:0 0 auto;padding:8px 11px}}
@@ -196,18 +482,24 @@ nav{{position:static;flex-direction:row;overflow-x:auto;gap:4px;margin-bottom:14
 .todo td{{display:flex;justify-content:space-between;gap:20px;padding:4px 0;border:0;text-align:right}}.todo td::before{{content:attr(data-label);color:var(--dim);font-size:12px;white-space:nowrap}}
 .todo td.chk{{display:none}}.todo td:nth-child(2){{display:block;margin-bottom:6px;text-align:left;font-weight:650}}.todo td:nth-child(2)::before{{display:none}}
 .timeline li{{grid-template-columns:48px 1fr;gap:11px}}.cards{{grid-template-columns:1fr}}.seg{{padding:12px}}
+.enhance-banner{{align-items:flex-start;flex-direction:column;gap:13px;padding:18px}}.enhance-banner a{{width:100%;text-align:center}}
 }}
 @media print{{
-.topbar,nav{{display:none}}body{{background:#fff}}.wrap{{display:block;max-width:none;padding:0}}.meeting-header,section{{padding:16px 0;border:0;border-bottom:1px solid #ddd;border-radius:0;box-shadow:none;break-inside:avoid}}
+.topbar,nav,.enhance-banner{{display:none}}body{{background:#fff}}.wrap{{display:block;max-width:none;padding:0}}.meeting-header,section{{padding:16px 0;border:0;border-bottom:1px solid #ddd;border-radius:0;box-shadow:none;break-inside:avoid}}
 .seg{{break-inside:avoid}}footer{{padding-bottom:0}}
 }}
+{INTERACTION_CSS}
 </style></head><body>
 <header class="topbar"><div class="topbar-inner"><a class="brand" href="/" aria-label="返回会议记录"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>adhere</a><span class="doc-label">MEETING NOTES</span></div></header>
 <div class="wrap"><nav aria-label="纪要章节"><span class="nav-title">本页目录</span>{nav}</nav><main>
-<header class="meeting-header"><div class="eyebrow">AI MEETING NOTES</div><h1>{html.escape(m.get("title", "会议纪要"))}</h1>
+<header class="meeting-header"><div class="eyebrow">AI MEETING NOTES</div>
+<div class="meeting-title-row"><h1>{html.escape(m.get("title", "会议纪要"))}</h1>{edit_button}</div>
 <div class="meta-row"><span><b>日期</b>{html.escape(m.get("date", ""))}</span><span><b>时长</b>{_dur(m.get("duration_s", 0))}</span>
 <span><b>发言人</b>{len(m.get("speakers", []))} 位</span><span><b>重点</b>{len(m.get("marks_ms", []))} 处</span></div>
 <div class="bars">{bars}</div></header>
-{body}
+{editor}
+<div id="minutes-view">{enhancement}
+{assistant}
+{body}</div>
 <footer>由 {html.escape(m.get("engine", ""))} 生成 · 内容仅依据会议录音整理，请核对后再分发</footer>
-</main></div></body></html>"""
+</main></div>{interaction_script}</body></html>"""

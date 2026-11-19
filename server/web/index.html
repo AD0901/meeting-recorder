@@ -81,6 +81,13 @@
     .number { display: inline-grid; place-items: center; width: 33px; height: 33px; margin-bottom: 30px; border-radius: 10px; background: #e8eedf; color: var(--green); font-size: 12px; font-weight: 750; }
     .card h3 { margin: 0 0 10px; font-size: 18px; }
     .card p { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.75; }
+    .enhance-feature { margin-top: 18px; padding: 26px 28px; border: 1px solid #d5dfca; border-radius: 20px; background: #e9f0e1; display: flex; align-items: center; justify-content: space-between; gap: 28px; }
+    .enhance-feature .eyebrow { margin-bottom: 10px; }
+    .enhance-feature h3 { margin: 0 0 8px; font-size: 20px; letter-spacing: -.4px; }
+    .enhance-feature p { margin: 0; max-width: 650px; color: var(--muted); font-size: 13px; line-height: 1.75; }
+    .format-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 15px; }
+    .format-chips span { padding: 3px 8px; border: 1px solid #cbd8bf; border-radius: 7px; background: rgba(255,255,255,.55); color: var(--green); font-size: 10px; font-weight: 650; }
+    .enhance-feature > a { flex-shrink: 0; white-space: nowrap; }
     .sample { padding: 84px 0; }
     .sample-grid { display: grid; grid-template-columns: 1.08fr .92fr; gap: 22px; align-items: start; }
     .sample-preview { padding: 32px; background: var(--ink); color: #fff; border-radius: 24px; box-shadow: 0 24px 50px rgba(23,34,28,.12); }
@@ -127,6 +134,7 @@
       .cards { grid-template-columns: 1fr; }
       .section-title p { display: none; }
       .sample-grid { grid-template-columns: 1fr; }
+      .enhance-feature { align-items: flex-start; flex-direction: column; gap: 18px; }
       .faq-list { grid-template-columns: 1fr; gap: 0; }
       .faq-item { padding: 20px 0; }
       .final-cta { align-items: flex-start; flex-direction: column; padding: 32px; }
@@ -215,6 +223,15 @@
           <article class="card"><span class="number">01</span><h3>轻松记录</h3><p>独立设备一键开始录音，云端自动接收，不再被手机和电脑打断。</p></article>
           <article class="card"><span class="number">02</span><h3>理解对话</h3><p>自动转写并区分不同发言人，重点内容随时打点，回顾更准确。</p></article>
           <article class="card"><span class="number">03</span><h3>沉淀行动</h3><p>提炼观点、结论和待办，让每场会议都有清晰、可追踪的结果。</p></article>
+        </div>
+        <div class="enhance-feature">
+          <div>
+            <div class="eyebrow">DOCUMENT ENHANCED</div>
+            <h3>让会议资料，也参与纪要整理。</h3>
+            <p>上传会议相关的方案、报表和演示材料，AI 会结合讨论原文与文档内容，补充背景、数据和目标，生成信息更完整的增强纪要。</p>
+            <div class="format-chips"><span>WORD</span><span>PPT</span><span>EXCEL</span><span>PDF</span><span>HTML</span><span>MD / TXT</span></div>
+          </div>
+          <a class="text-link" href="https://app.adhere.icu">体验资料增强 ↗</a>
         </div>
       </section>
 

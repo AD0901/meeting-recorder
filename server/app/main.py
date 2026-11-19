@@ -28,6 +28,7 @@ import uuid
 import wave
 import zlib
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
@@ -38,7 +39,7 @@ SERVER_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(SERVER_DIR / ".env")
 
 from app.docs_extract import MAX_FILE_BYTES, SUPPORTED, ExtractError, extract_text  # noqa: E402
-from app.llm import enhance_minutes, llm_ready  # noqa: E402
+from app.llm import answer_minutes_question, enhance_minutes, llm_ready  # noqa: E402
 from app.minutes.render import BASE_CSS, render_html  # noqa: E402
 from app.storage import make_storage  # noqa: E402
 
@@ -90,6 +91,17 @@ def update_meta(sid: str, **kw) -> dict:
         return meta
 
 
+def save_minutes(sid: str, minutes: dict) -> tuple[Path, Path]:
+    """原子保存结构化纪要，并同步更新可归档的静态 HTML。"""
+    mj = sdir(sid) / "minutes.json"
+    tmp = mj.with_suffix(".tmp")
+    tmp.write_text(json.dumps(minutes, ensure_ascii=False, indent=2))
+    tmp.replace(mj)
+    page = sdir(sid) / "minutes.html"
+    page.write_text(render_html(minutes))
+    return mj, page
+
+
 def check_token(authorization: str = Header(default="")) -> None:
     if API_TOKEN and authorization != f"Bearer {API_TOKEN}":
         raise HTTPException(401, "bad token")
@@ -132,6 +144,58 @@ class MarkIn(BaseModel):
 class EndIn(BaseModel):
     last_seq: int
     force: bool = False   # 缺片也结束（缺的地方补静音），设备第二次发 END 时用
+
+
+class ChatMessageIn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class AskIn(BaseModel):
+    question: str
+    history: list[ChatMessageIn] = []
+
+
+class ActionEditIn(BaseModel):
+    text: str = ""
+    owner: str = ""
+    due: str = ""
+
+
+class ChapterEditIn(BaseModel):
+    start_ms: int = 0
+    end_ms: int = 0
+    title: str = ""
+    summary: str = ""
+
+
+class SpeakerSummaryEditIn(BaseModel):
+    speaker: str = ""
+    summary: str = ""
+
+
+class QaEditIn(BaseModel):
+    q: str = ""
+    a: str = ""
+
+
+class TranscriptEditIn(BaseModel):
+    speaker: str = ""
+    start_ms: int = 0
+    text: str = ""
+
+
+class MinutesEditIn(BaseModel):
+    title: str
+    keywords: list[str]
+    summary: str
+    key_points: list[str]
+    actions: list[ActionEditIn]
+    next_steps: str
+    chapters: list[ChapterEditIn]
+    speaker_summaries: list[SpeakerSummaryEditIn]
+    qa: list[QaEditIn]
+    transcript: list[TranscriptEditIn]
 
 
 @app.get("/api/health", dependencies=[Depends(check_token)])
@@ -275,11 +339,9 @@ def process_session(sid: str) -> None:
         results = Tingwu.download_results(info, sdir(sid) / "tingwu")
         minutes = to_minutes(results, duration_s=dur, marks_ms=meta.get("marks_ms", []))
         minutes.setdefault("date", meta.get("created_at"))
-        (sdir(sid) / "minutes.json").write_text(json.dumps(minutes, ensure_ascii=False, indent=2))
-        page = sdir(sid) / "minutes.html"
-        page.write_text(render_html(minutes))
+        mj, page = save_minutes(sid, minutes)
         storage.put(f"sessions/{sid}/minutes.html", page)
-        storage.put(f"sessions/{sid}/minutes.json", sdir(sid) / "minutes.json")
+        storage.put(f"sessions/{sid}/minutes.json", mj)
         update_meta(sid, status="done", title=minutes.get("title"))
         log(f"✅ {sid} 纪要完成：{PUBLIC_URL}/sessions/{sid}")
         notify(sid, minutes.get("title") or "会议纪要已生成")
@@ -324,10 +386,21 @@ table{width:100%;border-collapse:collapse}
 td,th{padding:17px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
 tr:last-child td{border-bottom:0}th{background:color-mix(in srgb,var(--paper) 92%,var(--bg));color:var(--dim);font-size:12px;font-weight:550;white-space:nowrap}
 td{color:var(--dim);font-size:13px}td:last-child{width:130px;text-align:right}
-.op-cell{display:inline-flex;gap:12px;align-items:center}.secondary-link{color:var(--accent);font-size:12px;white-space:nowrap}
+.op-cell{display:inline-flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}.secondary-link{display:inline-flex;padding:5px 9px;border-radius:8px;background:color-mix(in srgb,var(--accent) 9%,transparent);color:var(--accent);font-size:12px;white-space:nowrap}.secondary-link.busy{background:#fff1d6;color:#996515}.secondary-link.failed{background:#fde8e5;color:#b8463c}
 .doc-body{max-width:860px}.doc-body h1{font-size:26px}.doc-body h2{font-size:19px;margin:26px 0 10px}.doc-body h3{font-size:16px;margin:20px 0 8px}
-.doc-body table{margin:12px 0}.doc-body td,.doc-body th{padding:8px 10px;border:1px solid var(--line);width:auto}
-.doc-body pre{background:var(--bg);padding:14px;border-radius:10px;overflow:auto}.doc-body blockquote{border-left:3px solid var(--line);margin:12px 0;padding:4px 14px;color:var(--dim)}
+.doc-body table{display:block;max-width:100%;margin:14px 0;overflow-x:auto}.doc-body td,.doc-body th{padding:9px 11px;border:1px solid var(--line);width:auto;min-width:90px}
+.doc-body pre{background:var(--bg);padding:14px;border-radius:10px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}.doc-body blockquote{border-left:3px solid var(--accent);margin:14px 0;padding:5px 15px;color:var(--dim);background:var(--bg)}.doc-body img{max-width:100%}.doc-body>*:first-child{margin-top:0}
+.enhance-card{max-width:840px}.enhance-intro{margin:0 0 18px;color:var(--dim);font-size:14px;line-height:1.85}
+.privacy-note{display:flex;gap:12px;align-items:flex-start;margin:18px 0;padding:14px 16px;border-radius:13px;background:var(--bg);color:var(--dim);font-size:12px;line-height:1.7}.privacy-note strong{flex-shrink:0;color:var(--accent);font-weight:650}
+.old-result{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:18px 0;padding:15px 16px;border:1px solid color-mix(in srgb,var(--accent) 25%,var(--line));border-radius:13px;background:color-mix(in srgb,var(--accent) 6%,var(--paper))}.old-result strong{font-size:13px}.old-result p{margin:3px 0 0;color:var(--dim);font-size:12px}
+.upload-zone{position:relative;min-height:200px;margin-top:22px;padding:28px;display:grid;place-items:center;border:1.5px dashed color-mix(in srgb,var(--accent) 40%,var(--line));border-radius:18px;background:color-mix(in srgb,var(--accent) 4%,var(--paper));text-align:center;transition:border-color .2s,background .2s}
+.upload-zone:hover,.upload-zone.dragging{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,var(--paper))}.upload-zone:focus-within{outline:3px solid color-mix(in srgb,var(--accent) 22%,transparent);outline-offset:3px}
+.upload-zone input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;z-index:2}.upload-prompt{pointer-events:none}.upload-icon{position:relative;width:46px;height:46px;margin:0 auto 14px;border:1px solid color-mix(in srgb,var(--accent) 35%,var(--line));border-radius:14px;background:var(--paper)}.upload-icon::before{content:"+";position:absolute;inset:0;display:grid;place-items:center;color:var(--accent);font-size:27px;font-weight:300}
+.upload-title{display:block;color:var(--ink);font-size:16px;font-weight:650}.upload-subtitle{display:block;margin-top:6px;color:var(--dim);font-size:12px}.format-list{display:flex;flex-wrap:wrap;justify-content:center;gap:6px;margin-top:15px}.format-list span{padding:3px 8px;border:1px solid var(--line);border-radius:7px;background:var(--paper);color:var(--dim);font-size:10px;font-weight:650}
+.form-note{margin:11px 0 0;color:var(--dim);font-size:12px}.file-selection:empty{display:none}.file-summary{margin:15px 0 0;color:var(--dim);font-size:12px}.file-list{display:grid;gap:8px;margin:10px 0 0;padding:0;list-style:none}.file-item{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:11px 13px;border-radius:11px;background:var(--bg);font-size:12px}.file-name{overflow-wrap:anywhere}.file-size{flex-shrink:0;color:var(--dim);white-space:nowrap}.file-item.invalid{background:#fff0ed;color:#9e4038}.file-item.invalid .file-size{color:#9e4038}
+.upload-error{display:none;margin-top:12px;padding:11px 13px;border-radius:10px;background:#fff0ed;color:#9e4038;font-size:12px}.upload-error.show{display:block}.form-actions{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin-top:20px}.primary-button:disabled{cursor:not-allowed;opacity:.45}
+.result-actions{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 20px}.processing-panel{display:flex;align-items:center;gap:17px;padding:20px;border-radius:14px;background:var(--bg)}.processing-panel strong{font-size:14px}.processing-panel p{margin:4px 0 0;color:var(--dim);font-size:12px}.processing-mark{width:28px;height:28px;flex-shrink:0;border:3px solid color-mix(in srgb,var(--accent) 20%,var(--line));border-top-color:var(--accent);border-radius:50%;animation:enhance-spin 1s linear infinite}@keyframes enhance-spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.processing-mark{animation:none}.upload-zone{transition:none}}
 .meeting-link{display:block;color:var(--ink);overflow-wrap:anywhere}.meeting-link strong{font-size:14px;font-weight:650}.meeting-link span{display:block;margin-top:3px;color:var(--dim);font-size:11px}
 .meeting-link:hover strong{color:var(--accent)}
 .st{display:inline-flex;align-items:center;padding:4px 10px;border-radius:99px;background:var(--line);color:var(--dim);font-size:12px;white-space:nowrap}
@@ -357,6 +430,7 @@ td{display:flex;align-items:center;justify-content:space-between;gap:20px;paddin
 td:first-child{display:block;padding:0 0 12px;text-align:left}td:first-child::before{display:none}td:last-child{width:100%;margin-top:8px;padding-top:13px;border-top:1px solid var(--line)}
 td.empty-cell{display:block;margin:0;padding:0;border:0;text-align:center}td.empty-cell::before{display:none}
 .status-card{margin-top:4px;padding:25px 20px}.step{font-size:12px}.step::before{left:20px}.steps{margin-bottom:24px}
+.upload-zone{min-height:180px;padding:22px 14px}.old-result{align-items:flex-start;flex-direction:column}.old-result .secondary-button{width:100%;text-align:center}
 }
 """
 
@@ -390,8 +464,16 @@ def index():
                    f"<button class='danger-link' type='submit'>删除</button></form>"
                    if deletable else "<span>—</span>")
         title = html.escape(m.get("title") or sid)
-        enhance_link = (f"<a class='secondary-link' href='/sessions/{sid}/enhance' "
-                        f"title='上传会议资料，AI 结合文档生成增强纪要'>资料增强</a>") if st == "done" else ""
+        enhance_link = ""
+        if st == "done":
+            enhance_st = m.get("enhance_status", "")
+            label, path, cls = {
+                "done": ("查看增强", "enhanced", ""),
+                "processing": ("增强中", "enhanced", "busy"),
+                "failed": ("增强失败 · 重试", "enhanced", "failed"),
+            }.get(enhance_st, ("资料增强", "enhance", ""))
+            enhance_link = (f"<a class='secondary-link {cls}' href='/sessions/{sid}/{path}' "
+                            f"title='上传会议资料，AI 结合文档生成增强纪要'>{label}</a>")
         rows.append(f"<tr><td data-label='会议'><a class='meeting-link' href='/sessions/{sid}'><strong>{title}</strong><span>{sid}</span></a></td>"
                     f"<td data-label='时间'>{m.get('created_at', '')}</td><td data-label='时长'>{fmt_dur(m.get('duration_s'))}</td>"
                     f"<td data-label='打点'>{len(m.get('marks_ms', []))} 处</td>"
@@ -403,7 +485,7 @@ def index():
             f"<p>每一场讨论，都整理成可以回顾与行动的结果。</p></div><span class='count'>{len(sessions)} 场会议</span></div>"
             "<div class='table-wrap'><table><thead><tr><th>会议</th><th>时间</th><th>时长</th><th>打点</th><th>状态</th><th></th></tr></thead><tbody>"
             + ("".join(rows) or empty) + "</tbody></table></div>")
-    busy = any(m.get("status") not in ("done", "failed") for m in sessions)
+    busy = any(m.get("status") not in ("done", "failed") or m.get("enhance_status") == "processing" for m in sessions)
     return page("会议记录", body, refresh=5 if busy else None)
 
 
@@ -414,7 +496,9 @@ def session_page(sid: str):
     mp = sdir(sid) / "minutes.html"
     if mj.exists():
         try:
-            return HTMLResponse(render_html(json.loads(mj.read_text())))
+            return HTMLResponse(render_html(json.loads(mj.read_text()), session_id=sid,
+                                            enhance_status=meta.get("enhance_status", ""),
+                                            assistant_enabled=llm_ready()))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             log(f"⚠️ {sid} 纪要 JSON 无法重渲染，使用原 HTML：{e}")
     if mp.exists():
@@ -444,6 +528,51 @@ def session_page(sid: str):
             f"<p class='session-id'>{sid}</p><div class='status-line'><span class='st {st}'>{STATUS_ZH.get(st, st)}</span></div>"
             f"<ol class='steps'>{''.join(steps)}</ol>{extra}<p class='refresh-note'>{note}</p></section>")
     return page(meta.get("title") or sid, body, refresh=None if st == "failed" else 5)
+
+
+@app.post("/api/sessions/{sid}/ask", dependencies=[Depends(check_web)])
+def ask_minutes(sid: str, body: AskIn):
+    """使用最新保存的纪要和转写调用大模型，支持浏览器内连续追问。"""
+    if not llm_ready():
+        raise HTTPException(503, "服务端还没配置 LLM_API_KEY，暂时无法使用纪要问答")
+    mj = sdir(sid) / "minutes.json"
+    if not mj.exists():
+        raise HTTPException(400, "会议纪要还没生成")
+    question = body.question.strip()
+    if not question:
+        raise HTTPException(400, "请输入问题")
+    if len(question) > 2000:
+        raise HTTPException(400, "问题不能超过 2000 字")
+    history = body.history[-12:]
+    if any(len(item.content) > 4000 for item in history):
+        raise HTTPException(400, "对话内容过长，请刷新页面后重新开始")
+    minutes = json.loads(mj.read_text())
+    try:
+        answer, usage = answer_minutes_question(
+            minutes, question, [item.model_dump() for item in history])
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        raise HTTPException(502, f"大模型问答失败：{e}") from e
+    log(f"💬 {sid} 纪要问答完成，tokens {usage.get('total_tokens', '—')}")
+    return {"answer": answer, "usage": usage}
+
+
+@app.put("/api/sessions/{sid}/minutes", dependencies=[Depends(check_web)])
+def edit_minutes(sid: str, body: MinutesEditIn):
+    """只更新页面开放编辑的字段，保留说话人统计、时长和打点等原始数据。"""
+    if not (sdir(sid) / "minutes.json").exists():
+        raise HTTPException(404, "minutes not found")
+    with _lock:
+        minutes = json.loads((sdir(sid) / "minutes.json").read_text())
+        updates = body.model_dump()
+        updates["title"] = updates["title"].strip() or "会议纪要"
+        minutes.update(updates)
+        mj, page = save_minutes(sid, minutes)
+    update_meta(sid, title=minutes["title"])
+    storage.put(f"sessions/{sid}/minutes.json", mj)
+    storage.put(f"sessions/{sid}/minutes.html", page)
+    log(f"✏️ {sid} 纪要已人工校正")
+    return {"ok": True, "title": minutes["title"]}
 
 
 @app.get("/sessions/{sid}/audio.wav", dependencies=[Depends(check_web)])
@@ -512,25 +641,121 @@ def enhance_form(sid: str):
         raise HTTPException(400, "基础纪要还没生成，等会议处理完成后再来")
     title = html.escape(meta.get("title") or sid)
     if not llm_ready():
-        body = ("<section class='status-card'><h1>资料增强</h1>"
-                "<p>服务端还没配置 LLM_API_KEY，暂时无法使用。请在 server/.env 中配置后重启服务。</p></section>")
+        body = (f"<section class='status-card enhance-card'><div class='eyebrow'>DOCUMENT ENHANCED MINUTES</div>"
+                f"<h1>资料增强</h1><p class='session-id'>{title}</p>"
+                "<div class='error-box'>服务端还没配置 LLM_API_KEY，暂时无法使用。请在 server/.env 中配置后重启服务。</div>"
+                f"<a class='secondary-button' href='/sessions/{sid}'>返回原纪要</a></section>")
         return page("资料增强", body)
+
     old = ""
     if (sdir(sid) / "enhanced.md").exists():
-        old = (f"<p>已生成过一份：<a href='/sessions/{sid}/enhanced'>查看增强纪要</a>。重新上传会覆盖它。</p>")
-    body = (f"<section class='status-card'><div class='eyebrow'>DOCUMENT ENHANCED MINUTES</div>"
+        old = (f"<div class='old-result'><div><strong>已有一份增强纪要</strong><p>重新生成会覆盖现有结果。</p></div>"
+               f"<a class='secondary-button' href='/sessions/{sid}/enhanced'>查看增强纪要</a></div>")
+    accept = ",".join(sorted(SUPPORTED))
+    script = """
+<script>
+(() => {
+  const allowed = new Set(__ALLOWED_EXTENSIONS__);
+  const maxBytes = __MAX_FILE_BYTES__;
+  const form = document.getElementById('enhance-form');
+  const input = document.getElementById('files');
+  const zone = document.getElementById('upload-zone');
+  const selection = document.getElementById('file-selection');
+  const errorBox = document.getElementById('upload-error');
+  const submitButton = document.getElementById('enhance-submit');
+  let invalidCount = 0;
+
+  const formatSize = bytes => bytes >= 1048576
+    ? `${(bytes / 1048576).toFixed(1)} MB`
+    : `${Math.max(1, Math.ceil(bytes / 1024))} KB`;
+
+  function renderFiles() {
+    const files = Array.from(input.files || []);
+    invalidCount = 0;
+    selection.replaceChildren();
+    errorBox.classList.remove('show');
+    errorBox.textContent = '';
+    submitButton.disabled = files.length === 0;
+    if (!files.length) return;
+
+    const summary = document.createElement('p');
+    summary.className = 'file-summary';
+    summary.textContent = `已选择 ${files.length} 份资料，共 ${formatSize(files.reduce((sum, file) => sum + file.size, 0))}`;
+    selection.appendChild(summary);
+    const list = document.createElement('ul');
+    list.className = 'file-list';
+
+    for (const file of files) {
+      const dot = file.name.lastIndexOf('.');
+      const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : '';
+      const wrongType = !allowed.has(ext);
+      const tooLarge = file.size > maxBytes;
+      const reason = wrongType ? '格式不支持' : (tooLarge ? '超过 20MB' : '');
+      if (reason) invalidCount += 1;
+
+      const item = document.createElement('li');
+      item.className = `file-item${reason ? ' invalid' : ''}`;
+      const name = document.createElement('span');
+      name.className = 'file-name';
+      name.textContent = file.name;
+      const size = document.createElement('span');
+      size.className = 'file-size';
+      size.textContent = `${formatSize(file.size)}${reason ? ` · ${reason}` : ''}`;
+      item.append(name, size);
+      list.appendChild(item);
+    }
+    selection.appendChild(list);
+    submitButton.disabled = invalidCount > 0;
+    if (invalidCount) {
+      errorBox.textContent = '请移除不支持的文件或超过 20MB 的文件，然后重新选择。';
+      errorBox.classList.add('show');
+    }
+  }
+
+  input.addEventListener('change', renderFiles);
+  for (const eventName of ['dragenter', 'dragover']) {
+    zone.addEventListener(eventName, event => {
+      event.preventDefault();
+      zone.classList.add('dragging');
+    });
+  }
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragging'));
+  zone.addEventListener('drop', event => {
+    event.preventDefault();
+    zone.classList.remove('dragging');
+    input.files = event.dataTransfer.files;
+    renderFiles();
+  });
+  form.addEventListener('submit', event => {
+    if (!input.files.length || invalidCount) {
+      event.preventDefault();
+      renderFiles();
+      return;
+    }
+    submitButton.disabled = true;
+    submitButton.textContent = '正在上传，请稍候…';
+  });
+  renderFiles();
+})();
+</script>
+"""
+    script = script.replace("__ALLOWED_EXTENSIONS__", json.dumps(sorted(SUPPORTED)))
+    script = script.replace("__MAX_FILE_BYTES__", str(MAX_FILE_BYTES))
+    body = (f"<section class='status-card enhance-card'><div class='eyebrow'>DOCUMENT ENHANCED MINUTES</div>"
             f"<h1>资料增强</h1><p class='session-id'>{title}</p>"
-            "<p>上传这场会议的相关资料（<strong>Word / PPT / Excel / PDF / HTML / MD / TXT</strong>，可多选，单文件 ≤ 20MB），"
-            "AI 会结合基础纪要、全文转写和文档内容，生成一份增强版会议纪要。</p>"
-            "<p style='color:var(--dim)'>🔒 文档只用于本次生成：解析出文字后<strong>立即删除原文件</strong>，"
-            "不在云端保留，也不会进入 OSS。云端只保留最终生成的增强纪要。</p>"
-            f"<form method='post' action='/sessions/{sid}/enhance' enctype='multipart/form-data'>"
-            "<p><input type='file' name='files' multiple required "
-            "accept='.docx,.pptx,.xlsx,.pdf,.html,.htm,.md,.txt'></p>"
-            "<button class='primary-button' type='submit'>上传并生成增强纪要</button> "
-            f"<a class='secondary-button' href='/sessions/{sid}'>返回会议</a></form>"
-            "<p style='color:var(--dim)'>生成约需 1 分钟，上传后页面会自动刷新结果。</p>"
-            f"{old}</section>")
+            "<p class='enhance-intro'>上传这场会议的背景材料，AI 会结合基础纪要、全文转写和文档内容，生成信息更完整的增强版会议纪要。</p>"
+            "<div class='privacy-note'><strong>原文件如何处理</strong><span>原文件只用于本次解析，处理结束后立即删除，不进入 OSS；云端仅保留最终生成的增强纪要。</span></div>"
+            f"{old}<form id='enhance-form' method='post' action='/sessions/{sid}/enhance' enctype='multipart/form-data'>"
+            f"<div class='upload-zone' id='upload-zone'><input id='files' type='file' name='files' multiple required accept='{accept}' "
+            "aria-label='选择会议资料' aria-describedby='upload-help'>"
+            "<div class='upload-prompt' aria-hidden='true'><div class='upload-icon'></div><span class='upload-title'>点击选择或拖拽资料到这里</span>"
+            "<span class='upload-subtitle'>可以一次选择多份会议材料</span><div class='format-list'>"
+            "<span>WORD</span><span>PPT</span><span>EXCEL</span><span>PDF</span><span>HTML</span><span>MD</span><span>TXT</span>"
+            "</div></div></div><p class='form-note' id='upload-help'>每个文件不超过 20MB，支持 Word / PPT / Excel / PDF / HTML / MD / TXT。</p>"
+            "<div class='file-selection' id='file-selection' aria-live='polite'></div><div class='upload-error' id='upload-error' role='alert'></div>"
+            "<div class='form-actions'><button class='primary-button' id='enhance-submit' type='submit'>上传并生成增强纪要</button>"
+            f"<a class='secondary-button' href='/sessions/{sid}'>返回原纪要</a></div></form>"
+            "<p class='form-note'>提交后会自动跳转到结果页，处理完成后页面会自动刷新。</p></section>" + script)
     return page("资料增强", body)
 
 
@@ -570,25 +795,33 @@ def enhanced_page(sid: str):
     title = html.escape(meta.get("title") or sid)
     md_file = sdir(sid) / "enhanced.md"
     if st == "processing":
-        body = ("<section class='status-card'><h1>正在生成增强纪要</h1>"
-                "<p>正在解析文档并调用大模型，约需 1 分钟。本页每 5 秒自动刷新。</p></section>")
+        body = (f"<section class='status-card enhance-card'><div class='eyebrow'>DOCUMENT ENHANCED MINUTES</div>"
+                f"<h1>正在生成增强纪要</h1><p class='session-id'>{title}</p>"
+                "<div class='status-line'><span class='st transcribing'>处理中</span></div>"
+                "<div class='processing-panel'><span class='processing-mark' aria-hidden='true'></span><div>"
+                "<strong>正在解析资料并生成内容</strong><p>上传已完成，服务器正在结合会议讨论与文档内容生成增强纪要。</p>"
+                "</div></div><p class='refresh-note'>本页每 5 秒自动刷新，完成后会直接显示结果。</p></section>")
         return page("增强纪要生成中", body, refresh=5)
     if st == "failed":
-        body = (f"<section class='status-card'><h1>生成失败</h1>"
+        body = (f"<section class='status-card enhance-card'><div class='eyebrow'>DOCUMENT ENHANCED MINUTES</div>"
+                f"<h1>增强纪要生成失败</h1><p class='session-id'>{title}</p>"
+                "<div class='status-line'><span class='st failed'>生成失败</span></div>"
                 f"<div class='error-box'>{html.escape(meta.get('enhance_error') or '未知错误')}</div>"
-                f"<a class='primary-button' href='/sessions/{sid}/enhance'>重新上传</a> "
-                f"<a class='secondary-button' href='/sessions/{sid}'>返回会议</a></section>")
+                "<div class='form-actions'>"
+                f"<a class='primary-button' href='/sessions/{sid}/enhance'>重新上传资料</a>"
+                f"<a class='secondary-button' href='/sessions/{sid}'>返回原纪要</a></div></section>")
         return page("增强纪要失败", body)
     if not md_file.exists():
         return RedirectResponse(f"/sessions/{sid}/enhance", status_code=303)
     import markdown
     content = markdown.markdown(md_file.read_text(), extensions=["tables", "fenced_code"])
     body = (f"<div class='page-heading'><div><div class='eyebrow'>ENHANCED MINUTES</div>"
-            f"<h1>增强版会议纪要</h1><p class='session-id'>{title} · 由 AI 结合会议资料生成</p></div></div>"
-            f"<p><a class='secondary-button' href='/sessions/{sid}'>← 原纪要</a> "
-            f"<a class='secondary-button' href='/sessions/{sid}/enhanced.md' download>下载 Markdown</a> "
-            f"<a class='secondary-button' href='/sessions/{sid}/enhance'>重新生成</a></p>"
-            f"<div class='status-card doc-body'>{content}</div>")
+            f"<h1>增强版会议纪要</h1><p class='session-id'>{title} · 由 AI 结合会议资料生成</p></div>"
+            "<span class='st done'>已增强</span></div>"
+            f"<div class='result-actions'><a class='secondary-button' href='/sessions/{sid}'>返回原纪要</a>"
+            f"<a class='primary-button' href='/sessions/{sid}/enhanced.md' download>下载 Markdown</a>"
+            f"<a class='secondary-button' href='/sessions/{sid}/enhance'>重新生成</a></div>"
+            f"<article class='status-card doc-body'>{content}</article>")
     return page(f"增强纪要 · {meta.get('title') or sid}", body)
 
 
