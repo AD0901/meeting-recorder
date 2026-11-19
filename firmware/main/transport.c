@@ -9,7 +9,6 @@
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_mac.h"
-#include "esp_random.h"
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -17,12 +16,12 @@
 #include "lwip/ip4_addr.h"
 #include "mbedtls/base64.h"
 #include "mdns.h"
+#include "sd_store.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "xport";
 
 static char s_device_id[13];
-static uint32_t s_boot_id;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static transport_status_t s_st;
 
@@ -42,57 +41,19 @@ void transport_get_status(transport_status_t *out)
         portEXIT_CRITICAL(&s_lock);  \
     } while (0)
 
-static void log_chunk_sent(const chunk_t *c, uint32_t ms)
+static uint8_t *s_pcm_buf;   /* PSRAM，一片音频的读文件缓冲 */
+
+static void pcm_path_of(char *out, size_t n, uint32_t id)
 {
-    uint32_t lag_ms = (uint32_t)((esp_timer_get_time() - c->t_us) / 1000);
-    ESP_LOGI(TAG, "seq %lu sent %lu B in %lu ms, queued %lu ms, ring %u/%u",
-             (unsigned long)c->seq, (unsigned long)c->len, (unsigned long)ms,
-             (unsigned long)lag_ms, (unsigned)ring_used() - 1, (unsigned)ring_capacity());
+    snprintf(out, n, "/sdcard/rec/%lu.pcm", (unsigned long)id);
 }
 
-/* ================================================================ 串口模式（里程碑 2） */
+/* ================================================================ 串口模式 */
 
 static unsigned char *s_b64;
 #define B64_CAP (CHUNK_MAX_BYTES * 4 / 3 + 8)
 
-static void serial_send(const chunk_t *c)
-{
-    switch (c->type) {
-    case CHUNK_BEGIN:
-        printf("\n@@BEGIN session=%lu device_id=%s sample_rate=16000 channels=1 format=pcm_s16le\n",
-               (unsigned long)c->session, s_device_id);
-        ST_SET(s_st.session = c->session; s_st.sent_chunks = 0; s_st.session_done = false);
-        break;
-    case CHUNK_AUDIO: {
-        int64_t t0 = esp_timer_get_time();
-        size_t olen = 0;
-        mbedtls_base64_encode(s_b64, B64_CAP, &olen, c->data, c->len);
-        uint32_t crc = esp_rom_crc32_le(0, c->data, c->len);
-        flockfile(stdout);  /* 整行不能被其他任务的日志插进来 */
-        printf("@@CHUNK session=%lu seq=%lu bytes=%lu crc32=%08lx b64=",
-               (unsigned long)c->session, (unsigned long)c->seq,
-               (unsigned long)c->len, (unsigned long)crc);
-        fwrite(s_b64, 1, olen, stdout);
-        fputc('\n', stdout);
-        fflush(stdout);
-        funlockfile(stdout);
-        uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
-        ST_SET(s_st.sent_chunks++; s_st.last_seq_sent = c->seq; s_st.last_send_ms = ms);
-        log_chunk_sent(c, ms);
-        break;
-    }
-    case CHUNK_MARK:
-        printf("@@MARK session=%lu offset_ms=%lu\n", (unsigned long)c->session, (unsigned long)c->seq);
-        break;
-    case CHUNK_END:
-        printf("@@END session=%lu last_seq=%ld\n", (unsigned long)c->session, (long)(int32_t)c->seq);
-        fflush(stdout);
-        ST_SET(s_st.session_done = true);
-        break;
-    }
-}
-
-/* ================================================================ HTTP 模式（里程碑 3） */
+/* ================================================================ HTTP 工具 */
 
 static char s_base[160];        /* 已把 .local 解析成 IP 的服务器地址 */
 static esp_http_client_handle_t s_cli;
@@ -189,12 +150,6 @@ static int http_req(esp_http_client_method_t method, const char *path, const cha
     return esp_http_client_get_status_code(s_cli);
 }
 
-/* 本地会话 → 服务端 session_id */
-static uint32_t s_local_session;
-static char s_sid[48];
-static bool s_session_lost;   /* 服务端说这个会话不存在了：剩下的消息丢掉 */
-static bool s_end_force;
-
 typedef enum { XR_OK, XR_RETRY, XR_DROP } result_t;
 
 static result_t classify(int code)
@@ -209,92 +164,141 @@ static result_t classify(int code)
     }
     ST_SET(s_st.online = true; s_st.auth_error = (code == 401));
     if (code == 401) return XR_RETRY;   /* 口令不对：等用户改配置，不丢数据 */
-    return XR_DROP;
+    return XR_DROP;                     /* 其他 4xx（如网页端已删除该会话）：放弃这段 */
 }
 
-static result_t http_send(const chunk_t *c)
+/* ================================================================ HTTP 上传一段 */
+
+static bool s_end_force;
+
+/* 确保有云端 session_id；device_session 去重键保证重发不会建重复会话 */
+static result_t ensure_session(rec_meta_t *m)
 {
+    if (m->session_id[0]) return XR_OK;
+    char json[220];
+    snprintf(json, sizeof(json),
+             "{\"device_id\":\"%s\",\"device_session\":\"sd-%lu\",\"sample_rate\":16000,"
+             "\"channels\":1,\"format\":\"pcm_s16le\"}",
+             s_device_id, (unsigned long)m->id);
+    int code = http_req(HTTP_METHOD_POST, "/api/sessions", "application/json", json, strlen(json), NULL);
+    result_t r = classify(code);
+    if (r != XR_OK) return r;
+
+    const char *p = strstr(s_resp, "\"session_id\"");
+    p = p ? strchr(p + 12, '"') : NULL;
+    if (!p) return XR_RETRY;
+    p++;
+    size_t n = strcspn(p, "\"");
+    char sid[48];
+    snprintf(sid, sizeof(sid), "%.*s", (int)n, p);
+    sd_store_set_session(sid);
+    strlcpy(m->session_id, sid, sizeof(m->session_id));
+    s_end_force = false;
+    ESP_LOGI(TAG, "rec %lu -> server %s", (unsigned long)m->id, sid);
+    return XR_OK;
+}
+
+static result_t upload_http(rec_meta_t *m)
+{
+    result_t r = ensure_session(m);
+    if (r != XR_OK) return r;
+
     char path[128], json[200];
-
-    if (c->type == CHUNK_BEGIN) {
-        snprintf(json, sizeof(json),
-                 "{\"device_id\":\"%s\",\"device_session\":\"%08lx-%lu\",\"sample_rate\":16000,"
-                 "\"channels\":1,\"format\":\"pcm_s16le\"}",
-                 s_device_id, (unsigned long)s_boot_id, (unsigned long)c->session);
-        int code = http_req(HTTP_METHOD_POST, "/api/sessions", "application/json", json, strlen(json), NULL);
-        result_t r = classify(code);
-        if (r == XR_OK) {
-            const char *p = strstr(s_resp, "\"session_id\"");
-            p = p ? strchr(p + 12, '"') : NULL;
-            if (!p) return XR_RETRY;
-            p++;
-            size_t n = strcspn(p, "\"");
-            snprintf(s_sid, sizeof(s_sid), "%.*s", (int)n, p);
-            s_local_session = c->session;
-            s_session_lost = false;
-            s_end_force = false;
-            ST_SET(s_st.session = c->session; s_st.sent_chunks = 0; s_st.session_done = false;
-                   s_st.retries = 0; strlcpy(s_st.server_session, s_sid, sizeof(s_st.server_session)));
-            ESP_LOGI(TAG, "session %lu -> server %s", (unsigned long)c->session, s_sid);
-        } else if (r == XR_DROP) {
-            ESP_LOGE(TAG, "server refused session (HTTP %d): %s", code, s_resp);
-            s_local_session = c->session;
-            s_session_lost = true;
-            ST_SET(s_st.session = c->session; s_st.session_done = false);
-        }
-        return r;
-    }
-
-    if (c->session != s_local_session || s_session_lost) {
-        if (c->type == CHUNK_END) ST_SET(s_st.session_done = true);
+    pcm_path_of(path, sizeof(path), m->id);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "rec %lu pcm missing, drop", (unsigned long)m->id);
         return XR_DROP;
     }
 
-    int code;
-    switch (c->type) {
-    case CHUNK_AUDIO: {
+    while (m->next_seq < m->total_chunks) {
+        fseek(f, (long)m->next_seq * CHUNK_MAX_BYTES, SEEK_SET);
+        size_t len = fread(s_pcm_buf, 1, CHUNK_MAX_BYTES, f);
+        if (len == 0) break;
         char crc[12];
-        snprintf(crc, sizeof(crc), "%08lx", (unsigned long)esp_rom_crc32_le(0, c->data, c->len));
-        snprintf(path, sizeof(path), "/api/sessions/%s/chunks?seq=%lu", s_sid, (unsigned long)c->seq);
+        snprintf(crc, sizeof(crc), "%08lx", (unsigned long)esp_rom_crc32_le(0, s_pcm_buf, len));
+        snprintf(path, sizeof(path), "/api/sessions/%s/chunks?seq=%lu", m->session_id,
+                 (unsigned long)m->next_seq);
         int64_t t0 = esp_timer_get_time();
-        code = http_req(HTTP_METHOD_POST, path, "application/octet-stream", c->data, c->len, crc);
+        int code = http_req(HTTP_METHOD_POST, path, "application/octet-stream", s_pcm_buf, len, crc);
         uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
-        result_t r = classify(code);
-        if (r == XR_OK) {
-            ST_SET(s_st.sent_chunks++; s_st.last_seq_sent = c->seq; s_st.last_send_ms = ms);
-            log_chunk_sent(c, ms);
-        } else if (r == XR_DROP) {
-            ESP_LOGE(TAG, "seq %lu refused (HTTP %d) %s", (unsigned long)c->seq, code, s_resp);
-            if (code == 404) s_session_lost = true;
+        r = classify(code);
+        if (r != XR_OK) {
+            fclose(f);
+            if (r == XR_DROP) ESP_LOGE(TAG, "seq %lu refused (HTTP %d) %s",
+                                       (unsigned long)m->next_seq, code, s_resp);
+            return r;
         }
-        return r;
-    }
-    case CHUNK_MARK:
-        snprintf(path, sizeof(path), "/api/sessions/%s/marks", s_sid);
-        snprintf(json, sizeof(json), "{\"offset_ms\":%lu}", (unsigned long)c->seq);
-        code = http_req(HTTP_METHOD_POST, path, "application/json", json, strlen(json), NULL);
-        if (code >= 200 && code < 300) ESP_LOGI(TAG, "mark %lu ms sent", (unsigned long)c->seq);
-        return classify(code);
-    case CHUNK_END: {
-        snprintf(path, sizeof(path), "/api/sessions/%s/end", s_sid);
-        snprintf(json, sizeof(json), "{\"last_seq\":%ld,\"force\":%s}", (long)(int32_t)c->seq,
-                 s_end_force ? "true" : "false");
-        code = http_req(HTTP_METHOD_POST, path, "application/json", json, strlen(json), NULL);
-        if (code == 409) {  /* 服务端说缺片（正常不会发生）：下次带 force 结束 */
-            ESP_LOGE(TAG, "server reports missing chunks: %s", s_resp);
-            s_end_force = true;
-            return XR_RETRY;
+        m->next_seq++;
+        sd_store_progress(m->next_seq);
+        ST_SET(s_st.sent_chunks = m->next_seq; s_st.last_send_ms = ms);
+        if (m->next_seq % 10 == 0) {
+            ESP_LOGI(TAG, "rec %lu %lu/%lu chunks, %lu ms/chunk", (unsigned long)m->id,
+                     (unsigned long)m->next_seq, (unsigned long)m->total_chunks, (unsigned long)ms);
         }
-        result_t r = classify(code);
-        if (r != XR_RETRY) {
-            ST_SET(s_st.session_done = true);
-            ESP_LOGI(TAG, "session %s ended (HTTP %d)", s_sid, code);
-        }
-        return r;
     }
-    default:
-        return XR_DROP;
+    fclose(f);
+
+    /* 打点（服务端按 offset 去重，重发安全） */
+    for (uint32_t i = 0; i < m->mark_count; i++) {
+        snprintf(path, sizeof(path), "/api/sessions/%s/marks", m->session_id);
+        snprintf(json, sizeof(json), "{\"offset_ms\":%lu}", (unsigned long)m->marks[i]);
+        int code = http_req(HTTP_METHOD_POST, path, "application/json", json, strlen(json), NULL);
+        r = classify(code);
+        if (r != XR_OK) return r;
     }
+
+    snprintf(path, sizeof(path), "/api/sessions/%s/end", m->session_id);
+    snprintf(json, sizeof(json), "{\"last_seq\":%ld,\"force\":%s}", (long)(int32_t)(m->total_chunks - 1),
+             s_end_force ? "true" : "false");
+    int code = http_req(HTTP_METHOD_POST, path, "application/json", json, strlen(json), NULL);
+    if (code == 409) {   /* 服务端校验缺片：补静音也要结束（正常不会发生） */
+        ESP_LOGE(TAG, "server reports missing chunks: %s", s_resp);
+        s_end_force = true;
+        return XR_RETRY;
+    }
+    r = classify(code);
+    if (r == XR_OK) ESP_LOGI(TAG, "rec %lu END confirmed", (unsigned long)m->id);
+    return r;
+}
+
+/* ================================================================ 串口上传一段 */
+
+static result_t upload_serial(rec_meta_t *m)
+{
+    printf("\n@@BEGIN session=%lu device_id=%s sample_rate=16000 channels=1 format=pcm_s16le\n",
+           (unsigned long)m->id, s_device_id);
+
+    char path[48];
+    pcm_path_of(path, sizeof(path), m->id);
+    FILE *f = fopen(path, "rb");
+    if (!f) return XR_DROP;
+
+    while (m->next_seq < m->total_chunks) {
+        fseek(f, (long)m->next_seq * CHUNK_MAX_BYTES, SEEK_SET);
+        size_t len = fread(s_pcm_buf, 1, CHUNK_MAX_BYTES, f);
+        if (len == 0) break;
+        size_t olen = 0;
+        mbedtls_base64_encode(s_b64, B64_CAP, &olen, s_pcm_buf, len);
+        uint32_t crc = esp_rom_crc32_le(0, s_pcm_buf, len);
+        flockfile(stdout);   /* 整行不能被其他任务的日志插进来 */
+        printf("@@CHUNK session=%lu seq=%lu bytes=%lu crc32=%08lx b64=",
+               (unsigned long)m->id, (unsigned long)m->next_seq, (unsigned long)len, (unsigned long)crc);
+        fwrite(s_b64, 1, olen, stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+        funlockfile(stdout);
+        m->next_seq++;
+        ST_SET(s_st.sent_chunks = m->next_seq);
+    }
+    fclose(f);
+
+    for (uint32_t i = 0; i < m->mark_count; i++) {
+        printf("@@MARK session=%lu offset_ms=%lu\n", (unsigned long)m->id, (unsigned long)m->marks[i]);
+    }
+    printf("@@END session=%lu last_seq=%ld\n", (unsigned long)m->id, (long)(int32_t)(m->total_chunks - 1));
+    fflush(stdout);
+    return XR_OK;
 }
 
 /* ================================================================ 任务 */
@@ -307,47 +311,53 @@ static void transport_task(void *arg)
     int fails = 0;
 
     while (1) {
-        chunk_t *c = ring_peek(pdMS_TO_TICKS(http ? 200 : 500));
-
-        if (!http) {
-            if (!c) continue;
-            serial_send(c);
-            ring_release();
+        rec_meta_t m;
+        if (!sd_store_claim_pending(&m)) {
+            if (http) {
+                if (!net_wait_connected(0)) {
+                    ST_SET(s_st.online = false);
+                } else if (esp_timer_get_time() - last_ping > 10 * 1000000LL) {
+                    /* 空闲时每 10 秒探一下服务端，屏幕上显示连没连上 */
+                    last_ping = esp_timer_get_time();
+                    int code = http_req(HTTP_METHOD_GET, "/api/health", NULL, NULL, 0, NULL);
+                    classify(code);
+                    if (code < 0 && ++fails >= 3) { s_base[0] = 0; fails = 0; }
+                    else if (code >= 0) fails = 0;
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(300));
             continue;
         }
 
-        if (!net_wait_connected(0)) {
+        if (http && !net_wait_connected(0)) {
             ST_SET(s_st.online = false);
-            if (s_cli) http_reset();
+            sd_store_release();
             net_wait_connected(pdMS_TO_TICKS(1000));
             continue;
         }
 
-        if (!c) {  /* 空闲时每 10 秒探一下服务端，屏幕上显示连没连上 */
-            if (esp_timer_get_time() - last_ping > 10 * 1000000LL) {
-                last_ping = esp_timer_get_time();
-                int code = http_req(HTTP_METHOD_GET, "/api/health", NULL, NULL, 0, NULL);
-                classify(code);
-                if (code < 0 && ++fails >= 3) { s_base[0] = 0; fails = 0; }  /* 重新解析 .local */
-                else if (code >= 0) fails = 0;
-            }
-            continue;
-        }
+        ST_SET(s_st.sent_chunks = m.next_seq);
+        result_t r = http ? upload_http(&m) : upload_serial(&m);
 
-        result_t r = http_send(c);
-        if (r == XR_RETRY) {
+        if (r == XR_OK) {
+            sd_store_finish();   /* 云端收齐，删卡上文件 */
+            backoff = 500;
+            fails = 0;
+        } else if (r == XR_DROP) {
+            ESP_LOGE(TAG, "rec %lu dropped by server, card file removed", (unsigned long)m.id);
+            sd_store_finish();
+            backoff = 500;
+            fails = 0;
+        } else {
+            sd_store_release();  /* 保存断点，稍后重试 */
             ST_SET(s_st.retries++);
-            if (++fails >= 3) { s_base[0] = 0; fails = 0; }  /* Mac 换了 IP 也能找回来 */
-            ESP_LOGW(TAG, "retry in %lu ms (ring %u/%u)", (unsigned long)backoff,
-                     (unsigned)ring_used(), (unsigned)ring_capacity());
+            if (++fails >= 3) { s_base[0] = 0; fails = 0; }
+            ESP_LOGW(TAG, "rec %lu retry in %lu ms (next_seq %lu/%lu)", (unsigned long)m.id,
+                     (unsigned long)backoff, (unsigned long)m.next_seq, (unsigned long)m.total_chunks);
             vTaskDelay(pdMS_TO_TICKS(backoff));
             backoff = backoff * 2 > 4000 ? 4000 : backoff * 2;
-            continue;
         }
-        fails = 0;
-        backoff = 500;
         last_ping = esp_timer_get_time();
-        ring_release();
     }
 }
 
@@ -357,9 +367,9 @@ void transport_start_task(void)
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_device_id, sizeof(s_device_id), "%02x%02x%02x%02x%02x%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    s_boot_id = esp_random();
-    s_st.session_done = true;
     s_st.mode = netcfg_usable(net_config()) ? XPORT_HTTP : XPORT_SERIAL;
+    s_pcm_buf = heap_caps_malloc(CHUNK_MAX_BYTES, MALLOC_CAP_SPIRAM);
+    assert(s_pcm_buf);
     if (s_st.mode == XPORT_SERIAL) {
         s_b64 = heap_caps_malloc(B64_CAP, MALLOC_CAP_SPIRAM);
         assert(s_b64);

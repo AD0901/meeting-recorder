@@ -15,7 +15,9 @@ SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new "root@$HOST")
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_CLOUD="$HERE/.env.cloud"
 
-rand() { LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c "$1"; }
+# 输入用有限的 base64 串而不是 /dev/urandom：urandom 无限输入下 tr 可能因 stdout 缓冲
+# 迟迟不写管道，head 退出后 tr 永远收不到 SIGPIPE，导致脚本挂死（macOS 上实测复现）
+rand() { openssl rand -base64 64 | LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9' | head -c "$1"; }
 
 if [ ! -f "$ENV_CLOUD" ]; then
   grep -vE '^(AUTO_OPEN|PUBLIC_URL|API_TOKEN|WEB_USER|WEB_PASSWORD)=' "$HERE/.env" > "$ENV_CLOUD"
@@ -29,7 +31,7 @@ if [ ! -f "$ENV_CLOUD" ]; then
     echo "WEB_PASSWORD=$(rand 12)"
   } >> "$ENV_CLOUD"
   chmod 600 "$ENV_CLOUD"
-  echo "已生成 $ENV_CLOUD（设备口令和网页密码都在里面）"
+  echo "已生成 ${ENV_CLOUD}（设备口令和网页密码都在里面）"
 fi
 
 echo "① 准备服务器环境"

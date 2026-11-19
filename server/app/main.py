@@ -18,6 +18,7 @@ import hmac
 import html
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -35,7 +36,7 @@ from pydantic import BaseModel
 SERVER_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(SERVER_DIR / ".env")
 
-from app.minutes.render import render_html  # noqa: E402
+from app.minutes.render import BASE_CSS, render_html  # noqa: E402
 from app.storage import make_storage  # noqa: E402
 
 DATA_DIR = Path(os.getenv("DATA_DIR", SERVER_DIR / "data")) / "sessions"
@@ -281,7 +282,10 @@ def process_session(sid: str) -> None:
         notify(sid, minutes.get("title") or "会议纪要已生成")
     except Exception as e:  # noqa: BLE001
         traceback.print_exc()
-        update_meta(sid, status="failed", error=f"{type(e).__name__}: {e}")
+        try:
+            update_meta(sid, status="failed", error=f"{type(e).__name__}: {e}")
+        except Exception:  # 处理中途会话被网页端删除：目录已不在，静默结束
+            pass
         log(f"❌ {sid} 处理失败：{e}")
 
 
@@ -298,20 +302,55 @@ def notify(sid: str, title: str) -> None:
 STATUS_ZH = {"uploading": "上传中", "processing": "拼接音频", "transcribing": "转写与总结中",
              "done": "已完成", "failed": "失败"}
 
-PAGE_CSS = """
-:root{--bg:#f6f7f9;--card:#fff;--text:#1d2129;--dim:#6b7280;--line:#e5e7eb;--accent:#2563eb}
-@media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1b2026;--text:#e8eaed;--dim:#9aa3ad;--line:#2b323a;--accent:#60a5fa}}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,"PingFang SC",sans-serif}
-main{max-width:860px;margin:0 auto;padding:32px 16px}
-h1{font-size:22px;margin:0 0 20px}
-table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
-td,th{padding:12px 14px;border-bottom:1px solid var(--line);text-align:left}
-th{color:var(--dim);font-weight:500;font-size:13px}
-a{color:var(--accent);text-decoration:none}
-.st{font-size:13px;padding:2px 8px;border-radius:10px;background:var(--line)}
-.done{background:#dcfce7;color:#166534}.failed{background:#fee2e2;color:#991b1b}
-@media (prefers-color-scheme:dark){.done{background:#14532d;color:#bbf7d0}.failed{background:#7f1d1d;color:#fecaca}}
-.card{background:var(--card);border-radius:12px;padding:24px}
+PAGE_CSS = BASE_CSS + """
+body{min-width:320px}
+.topbar{max-width:1120px;margin:auto;padding:22px 24px;display:flex;align-items:center;justify-content:space-between}
+.brand{display:inline-flex;align-items:center;gap:10px;color:var(--ink);font-size:20px;font-weight:750;letter-spacing:-.5px}
+.brand-mark{width:32px;height:32px;border-radius:10px;background:var(--ink);display:flex;align-items:center;justify-content:center;gap:3px}
+.brand-mark i{display:block;width:3px;border-radius:3px;background:var(--lime)}
+.brand-mark i:nth-child(1){height:8px}.brand-mark i:nth-child(2){height:16px}.brand-mark i:nth-child(3){height:11px}
+.topbar-note{color:var(--dim);font-size:11px;letter-spacing:1.8px}
+.shell{max-width:1080px;margin:0 auto;padding:30px 24px 64px}
+.page-heading{display:flex;align-items:end;justify-content:space-between;gap:24px;margin-bottom:28px}
+.eyebrow{margin-bottom:9px;color:var(--accent);font-size:11px;font-weight:750;letter-spacing:1.8px}
+h1{margin:0;font-size:32px;line-height:1.25;letter-spacing:-1px;overflow-wrap:anywhere}
+.page-heading p{margin:10px 0 0;color:var(--dim);font-size:14px}
+.count{flex-shrink:0;padding:7px 13px;border:1px solid var(--line);border-radius:99px;color:var(--dim);font-size:12px}
+.table-wrap{overflow:hidden;background:var(--paper);border:1px solid var(--line);border-radius:20px;box-shadow:0 12px 30px rgba(23,34,28,.04)}
+table{width:100%;border-collapse:collapse}
+td,th{padding:17px 18px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+tr:last-child td{border-bottom:0}th{background:color-mix(in srgb,var(--paper) 92%,var(--bg));color:var(--dim);font-size:12px;font-weight:550;white-space:nowrap}
+td{color:var(--dim);font-size:13px}td:last-child{width:56px;text-align:right}
+.meeting-link{display:block;color:var(--ink);overflow-wrap:anywhere}.meeting-link strong{font-size:14px;font-weight:650}.meeting-link span{display:block;margin-top:3px;color:var(--dim);font-size:11px}
+.meeting-link:hover strong{color:var(--accent)}
+.st{display:inline-flex;align-items:center;padding:4px 10px;border-radius:99px;background:var(--line);color:var(--dim);font-size:12px;white-space:nowrap}
+.st.done{background:color-mix(in srgb,var(--accent) 13%,transparent);color:var(--accent)}
+.st.failed{background:#fde8e5;color:#b8463c}.st.uploading,.st.processing,.st.transcribing{background:#fff1d6;color:#996515}
+.delete-form{margin:0}.danger-link{padding:5px 0;border:0;background:none;color:#b8463c;cursor:pointer;font-size:12px}.danger-link:hover{text-decoration:underline}
+.empty{padding:70px 24px;text-align:center}.empty-mark{width:48px;height:48px;margin:0 auto 18px;border:1px solid var(--line);border-radius:15px;display:flex;align-items:center;justify-content:center;gap:4px}
+.empty-mark i{width:4px;border-radius:4px;background:var(--accent)}.empty-mark i:nth-child(1){height:12px}.empty-mark i:nth-child(2){height:24px}.empty-mark i:nth-child(3){height:17px}
+.empty h2{margin:0 0 8px;color:var(--ink);font-size:18px}.empty p{margin:0;color:var(--dim)}
+.status-card{max-width:780px;margin:20px auto 0;padding:36px;background:var(--paper);border:1px solid var(--line);border-radius:22px;box-shadow:0 14px 35px rgba(23,34,28,.04)}
+.session-id{margin:8px 0 20px;color:var(--dim);font-size:12px;overflow-wrap:anywhere}.status-line{margin-bottom:28px}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin:0 0 30px;padding:0;list-style:none}
+.step{position:relative;padding-top:35px;color:var(--dim);font-size:13px}.step::before{content:"";position:absolute;top:13px;left:22px;right:0;height:1px;background:var(--line)}.step:last-child::before{display:none}
+.step-number{position:absolute;top:0;left:0;width:27px;height:27px;display:grid;place-items:center;border:1px solid var(--line);border-radius:50%;background:var(--paper);font-size:11px;z-index:1}
+.step.complete{color:var(--accent)}.step.complete .step-number{border-color:var(--accent);background:var(--accent);color:#fff}
+.step.current{color:var(--ink);font-weight:650}.step.current .step-number{border:6px solid color-mix(in srgb,var(--accent) 20%,var(--paper));background:var(--accent);color:transparent}
+.progress-note{padding:18px 20px;border-radius:14px;background:var(--bg);color:var(--dim)}.progress-note strong{display:block;color:var(--ink);font-size:23px}.progress-note span{font-size:13px}
+.error-box{margin-bottom:18px;padding:15px 17px;border-radius:12px;background:#fff0ed;color:#9e4038;font-size:13px;overflow-wrap:anywhere}
+.primary-button,.secondary-button{display:inline-flex;align-items:center;justify-content:center;padding:11px 18px;border-radius:11px;cursor:pointer;font-size:13px;font-weight:650}
+.primary-button{border:1px solid var(--ink);background:var(--ink);color:#fff}.secondary-button{border:1px solid var(--line);background:var(--paper);color:var(--ink)}
+.refresh-note{margin:24px 0 0;color:var(--dim);font-size:12px}
+@media (max-width:720px){
+.topbar{padding:18px}.topbar-note{display:none}.shell{padding:22px 14px 45px}.page-heading{align-items:flex-start;margin-bottom:22px}h1{font-size:27px}.page-heading p{font-size:13px}.count{margin-top:4px}
+.table-wrap{overflow:visible;background:transparent;border:0;box-shadow:none}table,tbody,tr,td{display:block;width:100%}thead{display:none}
+tr{margin-bottom:13px;padding:17px 18px;background:var(--paper);border:1px solid var(--line);border-radius:17px}
+td{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:6px 0;border:0;text-align:right}td::before{content:attr(data-label);color:var(--dim);font-size:12px;white-space:nowrap}
+td:first-child{display:block;padding:0 0 12px;text-align:left}td:first-child::before{display:none}td:last-child{width:100%;margin-top:8px;padding-top:13px;border-top:1px solid var(--line)}
+td.empty-cell{display:block;margin:0;padding:0;border:0;text-align:center}td.empty-cell::before{display:none}
+.status-card{margin-top:4px;padding:25px 20px}.step{font-size:12px}.step::before{left:20px}.steps{margin-bottom:24px}
+}
 """
 
 
@@ -319,7 +358,9 @@ def page(title: str, body: str, refresh: int | None = None) -> HTMLResponse:
     meta_refresh = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return HTMLResponse(f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{meta_refresh}
-<title>{html.escape(title)}</title><style>{PAGE_CSS}</style></head><body><main>{body}</main></body></html>""")
+<title>{html.escape(title)} · Adhere</title><style>{PAGE_CSS}</style></head><body>
+<header class="topbar"><a class="brand" href="/" aria-label="Adhere 会议记录首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>adhere</a><span class="topbar-note">MEETING NOTES</span></header>
+<main class="shell">{body}</main></body></html>""")
 
 
 def fmt_dur(s) -> str:
@@ -331,39 +372,69 @@ def fmt_dur(s) -> str:
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(check_web)])
 def index():
+    sessions = list_sessions()
     rows = []
-    for m in list_sessions():
+    for m in sessions:
         sid = m["session_id"]
         st = m.get("status", "")
-        rows.append(f"<tr><td><a href='/sessions/{sid}'>{html.escape(m.get('title') or sid)}</a></td>"
-                    f"<td>{m.get('created_at', '')}</td><td>{fmt_dur(m.get('duration_s'))}</td>"
-                    f"<td>{len(m.get('marks_ms', []))}</td>"
-                    f"<td><span class='st {st}'>{STATUS_ZH.get(st, st)}</span></td></tr>")
-    body = ("<h1>会议记录</h1><table><tr><th>会议</th><th>时间</th><th>时长</th><th>打点</th><th>状态</th></tr>"
-            + ("".join(rows) or "<tr><td colspan=5>还没有录音。在设备上点 REC 开始。</td></tr>") + "</table>")
-    busy = any(m.get("status") not in ("done", "failed") for m in list_sessions())
+        deletable = st not in ("processing", "transcribing")
+        del_btn = (f"<form class='delete-form' method='post' action='/sessions/{sid}/delete' "
+                   f"onsubmit=\"return confirm('删除这段录音和纪要？云端不可恢复。设备上已 Save 未传的不受影响。')\">"
+                   f"<button class='danger-link' type='submit'>删除</button></form>"
+                   if deletable else "<span>—</span>")
+        title = html.escape(m.get("title") or sid)
+        rows.append(f"<tr><td data-label='会议'><a class='meeting-link' href='/sessions/{sid}'><strong>{title}</strong><span>{sid}</span></a></td>"
+                    f"<td data-label='时间'>{m.get('created_at', '')}</td><td data-label='时长'>{fmt_dur(m.get('duration_s'))}</td>"
+                    f"<td data-label='打点'>{len(m.get('marks_ms', []))} 处</td>"
+                    f"<td data-label='状态'><span class='st {st}'>{STATUS_ZH.get(st, st)}</span></td>"
+                    f"<td data-label='操作'>{del_btn}</td></tr>")
+    empty = ("<tr><td class='empty-cell' colspan='6'><div class='empty'><div class='empty-mark' aria-hidden='true'><i></i><i></i><i></i></div>"
+             "<h2>还没有会议记录</h2><p>在设备上点 REC 开始，停止后选 SAVE 上传，会议会自动出现在这里。</p></div></td></tr>")
+    body = (f"<div class='page-heading'><div><div class='eyebrow'>MEETING LIBRARY</div><h1>会议记录</h1>"
+            f"<p>每一场讨论，都整理成可以回顾与行动的结果。</p></div><span class='count'>{len(sessions)} 场会议</span></div>"
+            "<div class='table-wrap'><table><thead><tr><th>会议</th><th>时间</th><th>时长</th><th>打点</th><th>状态</th><th></th></tr></thead><tbody>"
+            + ("".join(rows) or empty) + "</tbody></table></div>")
+    busy = any(m.get("status") not in ("done", "failed") for m in sessions)
     return page("会议记录", body, refresh=5 if busy else None)
 
 
 @app.get("/sessions/{sid}", response_class=HTMLResponse, dependencies=[Depends(check_web)])
 def session_page(sid: str):
     meta = load_meta(sid)
+    mj = sdir(sid) / "minutes.json"
     mp = sdir(sid) / "minutes.html"
+    if mj.exists():
+        try:
+            return HTMLResponse(render_html(json.loads(mj.read_text())))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            log(f"⚠️ {sid} 纪要 JSON 无法重渲染，使用原 HTML：{e}")
     if mp.exists():
         return HTMLResponse(mp.read_text())
-    st = meta.get("status")
+
+    st = meta.get("status", "")
+    current = {"uploading": 0, "processing": 1, "transcribing": 2}.get(st, -1)
+    steps = []
+    for i, label in enumerate(("录音上传", "音频拼接", "转写与总结")):
+        complete = st == "done" or current > i
+        cls = "complete" if complete else ("current" if current == i else "")
+        steps.append(f"<li class='step {cls}'><span class='step-number'>{'✓' if complete else i + 1}</span>{label}</li>")
+
     extra = ""
     if st == "uploading":
-        extra = f"已收到 {len(received_seqs(sid))} 秒录音"
+        extra = (f"<div class='progress-note'><strong>{len(received_seqs(sid))} 秒</strong>"
+                 "<span>云端已接收的录音时长，设备会继续上传。</span></div>")
     elif st == "failed":
-        extra = (html.escape(meta.get("error") or "") +
-                 f"<form method='post' action='/sessions/{sid}/retry'><button>重新处理</button></form>")
+        extra = (f"<div class='error-box'>{html.escape(meta.get('error') or '处理过程中出现未知错误')}</div>"
+                 f"<form method='post' action='/sessions/{sid}/retry'><button class='primary-button' type='submit'>重新处理</button></form>")
     elif sdir(sid).joinpath("audio.wav").exists():
-        extra = f"<a href='/sessions/{sid}/audio.wav'>下载录音</a>"
-    body = (f"<p><a href='/'>← 全部会议</a></p><div class='card'><h1>{sid}</h1>"
-            f"<p>状态：<span class='st {st}'>{STATUS_ZH.get(st, st)}</span></p><p>{extra}</p>"
-            f"<p style='color:var(--dim)'>本页每 5 秒自动刷新，纪要生成后会直接显示。</p></div>")
-    return page(sid, body, refresh=None if st == "failed" else 5)
+        extra = f"<a class='secondary-button' href='/sessions/{sid}/audio.wav'>下载录音</a>"
+
+    title = html.escape(meta.get("title") or "会议处理进度")
+    note = "可检查错误信息后重新处理。" if st == "failed" else "本页每 5 秒自动刷新，纪要生成后会直接显示。"
+    body = (f"<section class='status-card'><div class='eyebrow'>MEETING STATUS</div><h1>{title}</h1>"
+            f"<p class='session-id'>{sid}</p><div class='status-line'><span class='st {st}'>{STATUS_ZH.get(st, st)}</span></div>"
+            f"<ol class='steps'>{''.join(steps)}</ol>{extra}<p class='refresh-note'>{note}</p></section>")
+    return page(meta.get("title") or sid, body, refresh=None if st == "failed" else 5)
 
 
 @app.get("/sessions/{sid}/audio.wav", dependencies=[Depends(check_web)])
@@ -382,3 +453,15 @@ def retry(sid: str, bg: BackgroundTasks):
     update_meta(sid, status="processing", error=None)
     bg.add_task(process_session, sid)
     return RedirectResponse(f"/sessions/{sid}", status_code=303)
+
+
+@app.post("/sessions/{sid}/delete", dependencies=[Depends(check_web)])
+def delete_session(sid: str):
+    """网页端删除会议（测试录音随手清理）。处理中的会话等完成后再删；
+    删除 uploading 会话后，设备补传会收到 404，自动放弃并删掉卡上文件。"""
+    meta = load_meta(sid)
+    if meta.get("status") in ("processing", "transcribing"):
+        raise HTTPException(409, "正在转写/生成纪要，等完成后再删除")
+    shutil.rmtree(sdir(sid), ignore_errors=True)
+    log(f"🗑 会话 {sid} 已删除")
+    return RedirectResponse("/", status_code=303)

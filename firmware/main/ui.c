@@ -1,15 +1,15 @@
 /*
  * 屏幕界面（LVGL 8，触摸 + 侧键都能操作）
  *
- *   READY    中间一个红色圆形 REC 按钮，点一下开始录音
- *   REC      计时 / 音量条 / 打点数；底部 MARK（打点）和 STOP（停止）两个按钮
- *   SENDING  正在上传（断网时显示 Waiting for Wi-Fi），显示进度
- *   DONE     绿色对勾 + 本次时长、打点数；点 NEW 回到 READY（HTTP 模式下 = 服务端已确认收齐）
+ *   READY    中间一个红色圆形 REC 按钮，点一下开始录音（需要 TF 卡）
+ *   REC      计时 / 音量条 / 打点数；底部 MARK（打点）和 STOP（停止）；录音实时写 TF 卡
+ *   CONFIRM  停止后询问：SAVE（确认上传）/ DISCARD（删除，音频不出设备）
+ *   SENDING  正在上传（断网时显示 Waiting for Wi-Fi），显示进度；Later = 后台传，回 READY
+ *   DONE     云端确认收齐后显示；点 NEW 回到 READY
  *   SETUP    配网模式：二维码（手机扫码连设备热点）+ 打开 192.168.4.1 的提示
  *
  * 顶栏右侧是网络状态：绿色 Wi-Fi = 服务端连通；黄色 = 连上 Wi-Fi 但服务端不通；灰色 = 找网中。
- *
- * 只读取采集 / 传输模块的状态，每 100ms 刷新一次。
+ * 只读取采集 / 存储 / 传输模块的状态，每 100ms 刷新一次；Save/Discard 请求统一在本任务里执行。
  */
 #include "ui.h"
 
@@ -23,6 +23,7 @@
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sd_store.h"
 #include "transport.h"
 #include "wifi_mgr.h"
 
@@ -34,20 +35,29 @@
 #define COLOR_GREEN  lv_color_hex(0x43A047)
 #define COLOR_AMBER  lv_color_hex(0xFFB300)
 
-typedef enum { V_READY, V_REC, V_SENDING, V_DONE, V_SETUP, V_COUNT } view_t;
+typedef enum { V_READY, V_REC, V_CONFIRM, V_SENDING, V_DONE, V_SETUP, V_COUNT } view_t;
+typedef enum { PHASE_IDLE, PHASE_SAVING, PHASE_DONE } ui_phase_t;
 
 static lv_obj_t *s_top_left, *s_top_right;
 static lv_obj_t *s_view[V_COUNT];
-static lv_obj_t *s_ready_status, *s_rec_net, *s_send_title, *s_done_title, *s_setup_ssid, *s_setup_qr;
+static lv_obj_t *s_ready_status, *s_ready_pending, *s_rec_net, *s_send_title, *s_done_title;
+static lv_obj_t *s_setup_ssid, *s_setup_qr;
 /* REC */
 static lv_obj_t *s_rec_dot, *s_rec_time, *s_rec_marks, *s_rec_level;
+/* CONFIRM */
+static lv_obj_t *s_confirm_info;
 /* SENDING */
 static lv_obj_t *s_send_bar, *s_send_label;
 /* DONE */
 static lv_obj_t *s_done_info;
 
-static uint32_t s_dismissed_session;  /* DONE 页点了 NEW 的会话号 */
+static ui_phase_t s_phase = PHASE_IDLE;
+static volatile uint32_t s_btn_req;   /* 侧键 / 触摸共用的 Save/Discard 请求（在 LVGL 任务里执行） */
+enum { REQ_SAVE = 1, REQ_DISCARD = 2 };
 static uint32_t s_mark_flash;         /* 打点后按钮闪一下 */
+
+void ui_confirm_save(void)    { s_btn_req |= REQ_SAVE; }
+void ui_confirm_discard(void) { s_btn_req |= REQ_DISCARD; }
 
 /* ---------- 小工具 ---------- */
 
@@ -97,16 +107,19 @@ static const char *battery_symbol(int pct)
 
 /* ---------- 触摸事件（在 LVGL 任务里执行） ---------- */
 
-static void on_rec_tap(lv_event_t *e)  { capture_request_start(); }
+static void on_rec_tap(lv_event_t *e)
+{
+    sd_status_t sd;
+    sd_store_get_status(&sd);
+    if (sd.card_ok) capture_request_start();   /* 无卡：READY 状态行已有提示 */
+}
 static void on_stop_tap(lv_event_t *e) { capture_request_stop(); }
 static void on_mark_tap(lv_event_t *e) { capture_request_mark(); s_mark_flash = 3; }
 static void on_wifi_tap(lv_event_t *e) { ui_request_setup(); }
-static void on_new_tap(lv_event_t *e)
-{
-    capture_status_t cap;
-    capture_get_status(&cap);
-    s_dismissed_session = cap.session;
-}
+static void on_save_tap(lv_event_t *e)    { s_btn_req |= REQ_SAVE; }
+static void on_discard_tap(lv_event_t *e) { s_btn_req |= REQ_DISCARD; }
+static void on_later_tap(lv_event_t *e)   { s_phase = PHASE_IDLE; }   /* 后台继续传 */
+static void on_new_tap(lv_event_t *e)     { s_phase = PHASE_IDLE; }
 
 /* ---------- 刷新 ---------- */
 
@@ -123,10 +136,24 @@ static void refresh_cb(lv_timer_t *t)
     static uint32_t tick;
     tick++;
 
+    /* Save / Discard 统一在这里执行（LVGL 任务栈足够做文件 IO） */
+    if (s_btn_req & REQ_SAVE) {
+        s_btn_req &= ~REQ_SAVE;
+        sd_store_save();
+        s_phase = PHASE_SAVING;
+    }
+    if (s_btn_req & REQ_DISCARD) {
+        s_btn_req &= ~REQ_DISCARD;
+        sd_store_discard();
+        s_phase = PHASE_IDLE;
+    }
+
     capture_status_t cap;
     transport_status_t xp;
+    sd_status_t sd;
     capture_get_status(&cap);
     transport_get_status(&xp);
+    sd_store_get_status(&sd);
     net_status_t ns;
     net_get_status(&ns);
     bool http = xp.mode == XPORT_HTTP;
@@ -146,7 +173,9 @@ static void refresh_cb(lv_timer_t *t)
             lv_obj_set_style_text_color(s_top_right, COLOR_DIM, 0);
         }
         /* 待机页状态行 */
-        if (!http) {
+        if (!sd.card_ok) {
+            lv_label_set_text(s_ready_status, LV_SYMBOL_WARNING " Insert TF card to record");
+        } else if (!http) {
             lv_label_set_text(s_ready_status, "USB mode  ·  hold " LV_SYMBOL_LEFT " 3s for Wi-Fi");
         } else if (ns.state != NET_CONNECTED) {
             lv_label_set_text(s_ready_status, ns.ssid[0] ? "Connecting Wi-Fi ..." : "No known Wi-Fi nearby");
@@ -156,6 +185,14 @@ static void refresh_cb(lv_timer_t *t)
             lv_label_set_text(s_ready_status, "Server not reachable");
         } else {
             lv_label_set_text_fmt(s_ready_status, "%.20s  " LV_SYMBOL_OK " server", ns.ssid);
+        }
+        /* 待上传段数 */
+        if (sd.pending) {
+            lv_label_set_text_fmt(s_ready_pending, LV_SYMBOL_UPLOAD " %lu clip%s to upload",
+                                  (unsigned long)sd.pending, sd.pending > 1 ? "s" : "");
+            lv_obj_set_style_text_color(s_ready_pending, COLOR_AMBER, 0);
+        } else {
+            lv_label_set_text(s_ready_pending, "");
         }
     }
 
@@ -170,7 +207,6 @@ static void refresh_cb(lv_timer_t *t)
     }
 
     uint32_t sec = cap.elapsed_ms / 1000;
-    bool sending = !xp.session_done || ring_used() > 0;
 
     if (ns.state == NET_SETUP) {
         show_view(V_SETUP);
@@ -179,13 +215,18 @@ static void refresh_cb(lv_timer_t *t)
 
     if (cap.recording) {
         show_view(V_REC);
-        if (http) {
-            uint32_t queued = ring_used();
-            if (xp.online && queued <= 2) lv_label_set_text(s_rec_net, LV_SYMBOL_UPLOAD " live");
-            else lv_label_set_text_fmt(s_rec_net, LV_SYMBOL_WARNING " offline  %lu s buffered", (unsigned long)queued);
-            lv_obj_set_style_text_color(s_rec_net, xp.online && queued <= 2 ? COLOR_DIM : COLOR_AMBER, 0);
+        if (!sd.card_ok) {
+            lv_label_set_text(s_rec_net, LV_SYMBOL_WARNING " No TF card!");
+            lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
+        } else if (sd.write_error) {
+            lv_label_set_text(s_rec_net, LV_SYMBOL_WARNING " Card write error!");
+            lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
+        } else if (ring_used() > 30) {   /* 写卡明显滞后 */
+            lv_label_set_text_fmt(s_rec_net, LV_SYMBOL_WARNING " Card busy %lu s", (unsigned long)ring_used());
+            lv_obj_set_style_text_color(s_rec_net, COLOR_AMBER, 0);
         } else {
-            lv_label_set_text(s_rec_net, "");
+            lv_label_set_text(s_rec_net, LV_SYMBOL_SD_CARD " Saving to TF card");
+            lv_obj_set_style_text_color(s_rec_net, COLOR_DIM, 0);
         }
         lv_label_set_text_fmt(s_rec_time, "%02lu:%02lu", (unsigned long)(sec / 60), (unsigned long)(sec % 60));
         lv_label_set_text_fmt(s_rec_marks, LV_SYMBOL_BELL "  %lu", (unsigned long)cap.marks);
@@ -195,27 +236,52 @@ static void refresh_cb(lv_timer_t *t)
         else               lv_obj_add_flag(s_rec_dot, LV_OBJ_FLAG_HIDDEN);
         int lvl = (int)cap.level_db;
         lv_bar_set_value(s_rec_level, lvl < -60 ? -60 : lvl, LV_ANIM_OFF);
-    } else if (cap.session == 0 || cap.session == s_dismissed_session) {
-        show_view(V_READY);
-    } else if (sending) {
-        show_view(V_SENDING);
-        bool waiting = http && (ns.state != NET_CONNECTED || !xp.online);
-        lv_label_set_text(s_send_title, waiting ? LV_SYMBOL_WIFI "  Waiting for Wi-Fi" : LV_SYMBOL_UPLOAD "  Uploading");
-        uint32_t total = cap.chunks ? cap.chunks : 1;
-        lv_bar_set_range(s_send_bar, 0, (int32_t)total);
-        lv_bar_set_value(s_send_bar, (int32_t)xp.sent_chunks, LV_ANIM_OFF);
-        lv_label_set_text_fmt(s_send_label, "%lu / %lu s", (unsigned long)xp.sent_chunks, (unsigned long)total);
-    } else {
+        return;
+    }
+
+    if (sd.await_confirm) {
+        show_view(V_CONFIRM);
+        lv_label_set_text_fmt(s_confirm_info, "%02lu:%02lu  ·  %lu marks",
+                              (unsigned long)(sd.confirm_duration_s / 60),
+                              (unsigned long)(sd.confirm_duration_s % 60),
+                              (unsigned long)sd.confirm_marks);
+        return;
+    }
+
+    if (s_phase == PHASE_SAVING) {
+        if (!sd.saved_active) {
+            s_phase = PHASE_DONE;   /* 云端已确认收齐，落到 DONE */
+        } else {
+            show_view(V_SENDING);
+            bool waiting = http && (ns.state != NET_CONNECTED || !xp.online);
+            lv_label_set_text(s_send_title, waiting ? LV_SYMBOL_WIFI "  Waiting for Wi-Fi"
+                                                    : LV_SYMBOL_UPLOAD "  Uploading");
+            uint32_t total = sd.saved_total ? sd.saved_total : 1;
+            lv_bar_set_range(s_send_bar, 0, (int32_t)total);
+            lv_bar_set_value(s_send_bar, (int32_t)xp.sent_chunks, LV_ANIM_OFF);
+            lv_label_set_text_fmt(s_send_label, "%lu / %lu s", (unsigned long)xp.sent_chunks,
+                                  (unsigned long)total);
+            return;
+        }
+    }
+
+    if (s_phase == PHASE_DONE) {
         show_view(V_DONE);
         lv_label_set_text(s_done_title, http ? "Uploaded" : "Done");
         if (cap.dropped) {
             lv_label_set_text_fmt(s_done_info, LV_SYMBOL_WARNING " %02lu:%02lu  ·  %lu s lost",
-                                  (unsigned long)(sec / 60), (unsigned long)(sec % 60), (unsigned long)cap.dropped);
+                                  (unsigned long)(sd.saved_duration_s / 60),
+                                  (unsigned long)(sd.saved_duration_s % 60), (unsigned long)cap.dropped);
         } else {
             lv_label_set_text_fmt(s_done_info, "%02lu:%02lu  ·  %lu marks",
-                                  (unsigned long)(sec / 60), (unsigned long)(sec % 60), (unsigned long)cap.marks);
+                                  (unsigned long)(sd.saved_duration_s / 60),
+                                  (unsigned long)(sd.saved_duration_s % 60),
+                                  (unsigned long)sd.saved_marks);
         }
+        return;
     }
+
+    show_view(V_READY);
 }
 
 /* ---------- 构建 ---------- */
@@ -235,6 +301,8 @@ static void build_screen(void)
     lv_obj_t *v = s_view[V_READY] = mk_view(scr);
     lv_obj_t *rec = mk_button(v, 120, 120, COLOR_RED, LV_RADIUS_CIRCLE, "REC", &lv_font_montserrat_20, on_rec_tap);
     lv_obj_align(rec, LV_ALIGN_CENTER, 0, -22);
+    s_ready_pending = mk_label(v, &lv_font_montserrat_14, COLOR_AMBER, "");
+    lv_obj_align(s_ready_pending, LV_ALIGN_BOTTOM_MID, 0, -64);
     s_ready_status = mk_label(v, &lv_font_montserrat_14, COLOR_DIM, "");
     lv_obj_align(s_ready_status, LV_ALIGN_BOTTOM_MID, 0, -46);
     lv_obj_t *wifi = mk_button(v, 120, 34, COLOR_PANEL, 17, LV_SYMBOL_WIFI " Wi-Fi setup", &lv_font_montserrat_14, on_wifi_tap);
@@ -265,6 +333,17 @@ static void build_screen(void)
     lv_obj_t *stop = mk_button(v, 100, 64, COLOR_RED, 14, LV_SYMBOL_STOP " STOP", &lv_font_montserrat_14, on_stop_tap);
     lv_obj_align(stop, LV_ALIGN_BOTTOM_RIGHT, -12, -10);
 
+    /* CONFIRM：录完确认，Save 才上传 */
+    v = s_view[V_CONFIRM] = mk_view(scr);
+    lv_obj_t *title = mk_label(v, &lv_font_montserrat_20, COLOR_TEXT, "Save recording?");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+    s_confirm_info = mk_label(v, &lv_font_montserrat_20, COLOR_DIM, "");
+    lv_obj_align(s_confirm_info, LV_ALIGN_TOP_MID, 0, 66);
+    lv_obj_t *save = mk_button(v, 100, 64, COLOR_GREEN, 14, LV_SYMBOL_OK " SAVE", &lv_font_montserrat_14, on_save_tap);
+    lv_obj_align(save, LV_ALIGN_BOTTOM_LEFT, 12, -10);
+    lv_obj_t *del = mk_button(v, 100, 64, COLOR_RED, 14, LV_SYMBOL_TRASH " DEL", &lv_font_montserrat_14, on_discard_tap);
+    lv_obj_align(del, LV_ALIGN_BOTTOM_RIGHT, -12, -10);
+
     /* SENDING */
     v = s_view[V_SENDING] = mk_view(scr);
     s_send_title = mk_label(v, &lv_font_montserrat_20, COLOR_AMBER, LV_SYMBOL_UPLOAD "  Uploading");
@@ -276,6 +355,8 @@ static void build_screen(void)
     lv_obj_align(s_send_bar, LV_ALIGN_CENTER, 0, 0);
     s_send_label = mk_label(v, &lv_font_montserrat_14, COLOR_DIM, "");
     lv_obj_align(s_send_label, LV_ALIGN_CENTER, 0, 26);
+    lv_obj_t *later = mk_button(v, 120, 40, COLOR_PANEL, 20, "Later", &lv_font_montserrat_14, on_later_tap);
+    lv_obj_align(later, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     /* DONE */
     v = s_view[V_DONE] = mk_view(scr);
@@ -313,6 +394,7 @@ void ui_init(esp_lcd_panel_io_handle_t io, esp_lcd_panel_handle_t panel)
     lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
     port_cfg.task_affinity = 0;   /* CPU1 留给音频采集 */
     port_cfg.task_priority = 3;
+    port_cfg.task_stack = 8192;   /* Save/Discard 的 FATFS + cJSON 也在这个任务里执行 */
     ESP_ERROR_CHECK(lvgl_port_init(&port_cfg));
 
     lvgl_port_display_cfg_t disp_cfg = {
@@ -367,13 +449,6 @@ void ui_request_setup(void)
     }
     vTaskDelay(pdMS_TO_TICKS(400));
     net_request_setup();
-}
-
-void ui_dismiss_done(void)
-{
-    capture_status_t cap;
-    capture_get_status(&cap);
-    s_dismissed_session = cap.session;
 }
 
 void ui_show_power_off(void)
